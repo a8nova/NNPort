@@ -28,7 +28,7 @@ class PortRequest(BaseModel):
     max_iterations: int = 3
     input_shape: List[int] = [1, 10] # Default to what user likely needs, but they can change it
 
-UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "nnport_uploads")
+UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "nncompass_uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.get("/status")
