@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+torch
+numpy<2
+python-multipart
+python-multipart
+transformers
+google-generativeai
+openai
