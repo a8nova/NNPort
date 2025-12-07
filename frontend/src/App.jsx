@@ -3,7 +3,7 @@ import { useState, useEffect } from 'react'
 function App() {
   const [sourceFile, setSourceFile] = useState(null)
   const [targetType, setTargetType] = useState('DSP')
-  const [deviceConfig, setDeviceConfig] = useState({ mock: true, use_adb: false, adb_device_id: '' })
+  const [deviceConfig, setDeviceConfig] = useState({ mock: false, use_adb: false, adb_device_id: '' })
   const [inputShape, setInputShape] = useState('1, 10')
   const [logs, setLogs] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -103,7 +103,7 @@ function App() {
     <div className="layout">
       {/* Sidebar Configuration */}
       <aside className="sidebar">
-        <h1 className="section-title">NNCompass</h1>
+        <h1 className="section-title">NNPort</h1>
 
         {/* Tab Switcher */}
         <div style={{ display: 'flex', marginBottom: '1.5rem', borderBottom: '1px solid var(--border)' }}>
@@ -135,7 +135,7 @@ function App() {
               color: activeTab === 'manual' ? 'var(--text-primary)' : 'var(--text-secondary)'
             }}
           >
-            Manual Verify
+            Vibe Debug
           </button>
         </div>
 
@@ -194,10 +194,10 @@ function App() {
               type="checkbox"
               id="useAdb"
               checked={deviceConfig.use_adb}
-              onChange={(e) => setDeviceConfig({ ...deviceConfig, use_adb: e.target.checked, mock: !e.target.checked })}
+              onChange={(e) => setDeviceConfig({ ...deviceConfig, use_adb: e.target.checked })}
               style={{ width: 'auto', marginRight: '0.5rem' }}
             />
-            <label htmlFor="useAdb" style={{ fontSize: '0.875rem' }}>Use ADB</label>
+            <label htmlFor="useAdb" style={{ fontSize: '0.875rem' }}>Use ADB (Android Device)</label>
           </div>
 
           {deviceConfig.use_adb && (
@@ -209,6 +209,12 @@ function App() {
                 value={deviceConfig.adb_device_id || ''}
                 onChange={(e) => setDeviceConfig({ ...deviceConfig, adb_device_id: e.target.value })}
               />
+            </div>
+          )}
+          
+          {!deviceConfig.use_adb && (
+            <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.5rem' }}>
+              Running locally on this machine
             </div>
           )}
         </div>
@@ -237,7 +243,7 @@ function App() {
             disabled={!manualSourceFile || !manualRefFile || loading}
             style={{ width: '100%' }}
           >
-            {loading ? 'Verifying Code...' : 'Verify Manual Code'}
+            {loading ? 'Vibing...' : 'Vibe Debug'}
           </button>
         )}
 
@@ -285,7 +291,7 @@ function App() {
           <h2 className="section-title">Porting Progress</h2>
           {!logs && !loading ? (
             <div style={{ color: 'var(--text-secondary)', textAlign: 'center', padding: '2rem' }}>
-              Upload a model and select target hardware to begin the porting loop.
+              Upload a model and select target hardware to begin vibe debuging.
             </div>
           ) : (
             <div className="logs-container">

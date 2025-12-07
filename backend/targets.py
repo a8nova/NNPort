@@ -15,4 +15,4 @@ class DeviceConfig(BaseModel):
     adb_device_id: Optional[str] = None # e.g. serial number
     remote_work_dir: str = "/data/local/tmp"
     compiler_cmd: str = "gcc" # Default to host gcc for now, user can change to arm-linux-androideabi-gcc
-    mock: bool = True # For MVP, default to mock
+    mock: bool = False # Run locally by default

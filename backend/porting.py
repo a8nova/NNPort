@@ -1,6 +1,8 @@
 import time
 import os
 import uuid
+import shutil
+import subprocess
 import numpy as np
 from typing import Dict, List, Any, Optional
 from backend.targets import TargetType, DeviceConfig
@@ -30,11 +32,20 @@ class CodeGenerator:
         else:
              self.gemini_model = None
 
-    def generate(self, original_model_source: str, target: TargetType, iteration: int) -> str:
+    def generate(self, original_model_source: str, target: TargetType, iteration: int, error_feedback: str = None) -> str:
         """
         Generates code for the target architecture.
         Prioritizes OpenAI (GPT-4o), falls back to Gemini, then Mock.
         """
+        
+        error_context = ""
+        if error_feedback:
+            error_context = f"""
+PREVIOUS ATTEMPT FAILED:
+{error_feedback}
+
+Please fix this issue in your new code generation.
+"""
         
         prompt = f"""
 You are an expert AI compiler engineer specialized in porting PyTorch models to high-performance hardware targets.
@@ -46,23 +57,38 @@ Context:
 ```python
 {original_model_source}
 ```
-
+{error_context}
 Requirements:
 1. Output ONLY valid, compilable C source code (C11) that can be compiled with gcc or Android NDK clang.
 2. Do NOT use C++ features at all - no classes, cout, vector, string, new/delete, R"..." raw strings.
 3. Do NOT include OpenCL/CUDA headers like <CL/cl.h> or <cuda.h>. The code must compile standalone.
 4. Only use these headers: <stdio.h>, <stdlib.h>, <string.h>, <math.h>
 5. Use FIXED-SIZE arrays or malloc/free for dynamic arrays. Do NOT use VLAs (Variable Length Arrays) with initializers.
-6. Include a main() function that performs the inference computation and prints results using printf().
+6. Include a main() function that:
+   - Reads input from "input.bin" file (float32 binary format) instead of using hardcoded test values
+   - Performs the inference computation
+   - Prints results using printf()
+   - Writes the COMPLETE output array to "output.bin" using fwrite()
+   - CRITICAL: Write ALL output values (the entire array) in one fwrite() call: fwrite(output_array, sizeof(float), num_output_elements, fp)
 7. For arrays: Either use fixed sizes like float weights[5][10] or use malloc.
 8. Use regular C string literals "..." NEVER raw strings like R"CL(...)CL" or R"EOF(...)EOF".
 9. Keep it simple - pure procedural C code only. No C++ syntax whatsoever.
+10. IMPORTANT: Read input from "input.bin" file, do NOT use hardcoded test data!
 
 IMPORTANT: Do NOT use:
   ❌ const char* x = R"CL(...)CL";              // Raw string - C++11 only
   ❌ float arr[size] = {{...}};                   // VLA with initializer - NOT allowed in C
-  ✅ float arr[5] = {{...}};                      // Fixed size with initializer - OK
+  ❌ float input[10] = {{0.1, 0.2, ...}};         // Hardcoded test data - NOT allowed
+  ✅ float arr[5] = {{...}};                      // Fixed size with initializer - OK for weights
   ✅ float* arr = malloc(size * sizeof(float)); // Dynamic allocation - OK
+
+EXAMPLE: Reading input from file:
+```c
+FILE* fp = fopen("input.bin", "rb");
+float input[NUM_INPUTS];
+fread(input, sizeof(float), NUM_INPUTS, fp);
+fclose(fp);
+```
 
 Generate the code now. Do not wrap in markdown code blocks, just return raw code if possible, or I will strip them.
 """     
@@ -77,12 +103,7 @@ Generate the code now. Do not wrap in markdown code blocks, just return raw code
                     ]
                 )
                 code = response.choices[0].message.content
-                # Strip markdown code blocks if present
-                if code.startswith("```"):
-                     code = "\n".join(code.split("\n")[1:])
-                if code.endswith("```"):
-                     code = code[:-3]
-                # Remove OpenCL/CUDA headers that would cause compilation errors
+                # Strip markdown and sanitize code
                 code = self._sanitize_code(code)
                 return code
             except Exception as e:
@@ -106,6 +127,9 @@ Generate the code now. Do not wrap in markdown code blocks, just return raw code
     def _sanitize_code(self, code: str) -> str:
         """Remove problematic includes and C++ syntax that would prevent compilation"""
         import re
+        
+        # First strip markdown
+        code = self._strip_markdown(code)
         
         original_code = code
         
@@ -145,6 +169,28 @@ Generate the code now. Do not wrap in markdown code blocks, just return raw code
                 sanitized.append(line)
         
         return '\n'.join(sanitized)
+    
+    def _strip_markdown(self, code: str) -> str:
+        """Remove markdown code block markers from generated code"""
+        import re
+        
+        # Remove opening code fence (```c, ```cpp, ```C, etc.)
+        code = re.sub(r'^```[a-zA-Z]*\n', '', code, flags=re.MULTILINE)
+        
+        # Remove closing code fence
+        code = re.sub(r'\n```\s*$', '', code)
+        code = re.sub(r'^```\s*$', '', code, flags=re.MULTILINE)
+        
+        # Remove any stray ``` markers in the middle
+        lines = []
+        for line in code.split('\n'):
+            stripped = line.strip()
+            # Skip lines that are just ```
+            if stripped == '```' or stripped.startswith('```') and len(stripped) < 10:
+                continue
+            lines.append(line)
+        
+        return '\n'.join(lines)
 
     def _get_mock_template(self, original_model_source: str, target: TargetType, iteration: int) -> str:
         if target == TargetType.OPENCL:
@@ -191,9 +237,34 @@ class Compiler:
     def __init__(self):
         self.ndk_path = self._find_android_ndk()
     
+    def _strip_markdown(self, code: str) -> str:
+        """Remove markdown code block markers from generated code"""
+        import re
+        
+        # Remove opening code fence (```c, ```cpp, ```C, etc.)
+        code = re.sub(r'^```[a-zA-Z]*\n', '', code, flags=re.MULTILINE)
+        
+        # Remove closing code fence
+        code = re.sub(r'\n```\s*$', '', code)
+        code = re.sub(r'^```\s*$', '', code, flags=re.MULTILINE)
+        
+        # Remove any stray ``` markers in the middle
+        lines = []
+        for line in code.split('\n'):
+            stripped = line.strip()
+            # Skip lines that are just ```
+            if stripped == '```' or stripped.startswith('```') and len(stripped) < 10:
+                continue
+            lines.append(line)
+        
+        return '\n'.join(lines)
+    
     def _sanitize_code(self, code: str) -> str:
         """Remove problematic includes and C++ syntax that would prevent compilation"""
         import re
+        
+        # First strip markdown
+        code = self._strip_markdown(code)
         
         original_code = code
         
@@ -353,16 +424,98 @@ class Compiler:
 class DeviceRunner:
     def deploy_and_run(self, binary_path: str, input_data: np.ndarray, config: DeviceConfig, expected_output: Optional[np.ndarray] = None, logs: List[Dict[str, Any]] = None) -> np.ndarray:
         """
-        Deploy and run on device. Supports ADB or Mock.
+        Deploy and run on device. Supports ADB, Local, or Mock.
         """
-        if config.mock and not config.use_adb:
-            return self._run_mock(binary_path, input_data, expected_output)
-        
         if config.use_adb:
             return self._run_adb(binary_path, input_data, config, expected_output, logs=logs)
-            
-        raise NotImplementedError("Execution method not implemented")
+        
+        if config.mock:
+            return self._run_mock(binary_path, input_data, expected_output)
+        
+        # If not mock and not ADB, try local execution
+        return self._run_local(binary_path, input_data, expected_output, logs=logs)
 
+    def _run_local(self, binary_path: str, input_data: np.ndarray, expected_output: Optional[np.ndarray] = None, logs: List[Dict[str, Any]] = None) -> np.ndarray:
+        """
+        Run binary locally on host machine (macOS/Linux).
+        """
+        if logs is None:
+            logs = []
+        
+        # Write input data to file
+        input_file = binary_path + ".input"
+        input_data.tofile(input_file)
+        
+        # Create symlink for input.bin in same directory as binary
+        binary_dir = os.path.dirname(binary_path)
+        if not binary_dir:
+            binary_dir = "/tmp"
+        local_input = os.path.join(binary_dir, "input.bin")
+        local_output = os.path.join(binary_dir, "output.bin")
+        
+        # Copy input file
+        shutil.copy(input_file, local_input)
+        
+        try:
+            if logs is not None:
+                logs.append({"stage": "Local Execute", "status": "Running", "details": f"Executing {os.path.basename(binary_path)} locally..."})
+            
+            # Make sure binary is executable
+            os.chmod(binary_path, 0o755)
+            
+            # Execute binary locally
+            result = subprocess.run([binary_path], capture_output=True, text=True, timeout=30, cwd=binary_dir)
+            
+            if logs is not None:
+                stdout_preview = result.stdout[:200] if result.stdout else "No output"
+                logs.append({"stage": "Local Execute", "status": "Success" if result.returncode == 0 else "Failed", 
+                           "details": f"Exit code: {result.returncode}\nOutput: {stdout_preview}"})
+            
+            if result.returncode != 0:
+                error_msg = f"Binary execution failed with exit code {result.returncode}\nSTDERR: {result.stderr}"
+                if logs is not None:
+                    logs.append({"stage": "Local Execute", "status": "Failed", "details": error_msg})
+                raise RuntimeError(error_msg)
+            
+            # Read output file
+            if os.path.exists(local_output) and os.path.getsize(local_output) > 0:
+                output_array = np.fromfile(local_output, dtype=np.float32)
+                
+                # Validate size matches expectation
+                if expected_output is not None:
+                    expected_size = expected_output.size
+                    if len(output_array) != expected_size:
+                        error_msg = f"Size mismatch: Parsed {len(output_array)} values but expected {expected_size} values."
+                        if logs is not None:
+                            logs.append({"stage": "Output Parsing", "status": "Failed", "details": error_msg})
+                        raise ValueError(error_msg)
+                    
+                    # Reshape to expected shape
+                    output_array = output_array.reshape(expected_output.shape)
+                
+                if logs is not None:
+                    logs.append({"stage": "Output Parsing", "status": "Success", 
+                               "details": f"Parsed {len(output_array)} float32 values, shape: {output_array.shape}"})
+                
+                return output_array
+            else:
+                error_msg = "Output file not found or empty"
+                if logs is not None:
+                    logs.append({"stage": "Output Parsing", "status": "Failed", "details": error_msg})
+                raise FileNotFoundError(error_msg)
+                
+        except subprocess.TimeoutExpired:
+            error_msg = "Binary execution timed out (30s)"
+            if logs is not None:
+                logs.append({"stage": "Local Execute", "status": "Failed", "details": error_msg})
+            raise RuntimeError(error_msg)
+        finally:
+            # Cleanup
+            if os.path.exists(local_input):
+                os.remove(local_input)
+            if os.path.exists(local_output):
+                os.remove(local_output)
+    
     def _run_mock(self, binary_path: str, input_data: np.ndarray, expected_output: Optional[np.ndarray] = None) -> np.ndarray:
         time.sleep(1) # Simulate
         
@@ -404,8 +557,13 @@ class DeviceRunner:
         
         if logs is None:
             logs = []
-            
+        
+        # Write input data to file
+        input_file = binary_path + ".input"
+        input_data.tofile(input_file)
+        
         remote_bin = f"{config.remote_work_dir}/{os.path.basename(binary_path)}"
+        remote_input = f"{config.remote_work_dir}/input.bin"
         remote_out = f"{config.remote_work_dir}/output.bin"
         
         adb_cmd = [ADB_PATH]
@@ -423,7 +581,17 @@ class DeviceRunner:
             if logs is not None:
                 logs.append({"stage": "ADB Push", "status": "Success", "details": f"Copied to {remote_bin}"})
             
-            # Step 2: Set executable permissions
+            # Step 2: Push input data to device
+            if logs is not None:
+                logs.append({"stage": "ADB Push Input", "status": "Running", "details": f"Copying input data ({input_data.size} values) to device..."})
+            
+            push_input_cmd = adb_cmd + ["push", input_file, remote_input]
+            subprocess.run(push_input_cmd, capture_output=True, text=True, check=True)
+            
+            if logs is not None:
+                logs.append({"stage": "ADB Push Input", "status": "Success", "details": f"Input data copied to {remote_input}"})
+            
+            # Step 3: Set executable permissions
             if logs is not None:
                 logs.append({"stage": "ADB Chmod", "status": "Running", "details": "Setting executable permissions..."})
             
@@ -433,7 +601,7 @@ class DeviceRunner:
             if logs is not None:
                 logs.append({"stage": "ADB Chmod", "status": "Success", "details": "Permissions set"})
             
-            # Step 3: Execute binary on device
+            # Step 4: Execute binary on device
             if logs is not None:
                 logs.append({"stage": "ADB Execute", "status": "Running", "details": f"Running {os.path.basename(binary_path)} on device..."})
             
@@ -444,7 +612,7 @@ class DeviceRunner:
                 stdout_preview = exec_result.stdout[:200] if exec_result.stdout else "No output"
                 logs.append({"stage": "ADB Execute", "status": "Success", "details": f"Execution complete\nOutput: {stdout_preview}"})
             
-            # Step 4: Pull output file from device
+            # Step 5: Pull output file from device
             if logs is not None:
                 logs.append({"stage": "ADB Pull", "status": "Running", "details": f"Retrieving output from {remote_out}..."})
             
@@ -457,20 +625,55 @@ class DeviceRunner:
                 if logs is not None:
                     logs.append({"stage": "ADB Pull", "status": "Success", "details": f"Output retrieved to {local_out}"})
                 
-                # Try to parse output file
-                # This assumes the binary wrote numpy-compatible data
-                # For now, we'll just log that we got it
-                if logs is not None:
-                    logs.append({"stage": "Output Parsing", "status": "Info", "details": "Output file retrieved but parsing not implemented yet"})
+                # Parse the output file (float32 binary format)
+                try:
+                    if os.path.exists(local_out) and os.path.getsize(local_out) > 0:
+                        output_array = np.fromfile(local_out, dtype=np.float32)
+                        num_parsed = len(output_array)
+                        
+                        # Validate size matches expectation
+                        if expected_output is not None:
+                            expected_size = expected_output.size
+                            if num_parsed != expected_size:
+                                error_msg = f"Size mismatch: Parsed {num_parsed} values but expected {expected_size} values. The generated C code likely only wrote {num_parsed} value(s) instead of the full array."
+                                if logs is not None:
+                                    logs.append({"stage": "Output Parsing", "status": "Failed", 
+                                               "details": error_msg})
+                                raise ValueError(error_msg)
+                            
+                            # Reshape to expected shape
+                            try:
+                                output_array = output_array.reshape(expected_output.shape)
+                            except ValueError as e:
+                                # Shape mismatch
+                                if logs is not None:
+                                    logs.append({"stage": "Output Parsing", "status": "Warning", 
+                                               "details": f"Could not reshape output from {output_array.shape} to {expected_output.shape}: {str(e)}"})
+                        
+                        if logs is not None:
+                            logs.append({"stage": "Output Parsing", "status": "Success", 
+                                       "details": f"Parsed {num_parsed} float32 values, shape: {output_array.shape}"})
+                        
+                        return output_array
+                    else:
+                        if logs is not None:
+                            logs.append({"stage": "Output Parsing", "status": "Warning", 
+                                       "details": "Output file is empty or doesn't exist"})
+                        raise FileNotFoundError("Empty or missing output file")
+                        
+                except Exception as e:
+                    if logs is not None:
+                        logs.append({"stage": "Output Parsing", "status": "Failed", 
+                                   "details": f"Failed to parse output: {str(e)}"})
+                    # Fall through to mock data
                     
             except subprocess.CalledProcessError:
                 if logs is not None:
                     logs.append({"stage": "ADB Pull", "status": "Warning", "details": "No output file found on device"})
             
-            # Return mock data for now (since we don't know the exact output format yet)
-            # In a real implementation, we'd parse the output.bin file here
+            # Fallback: Return mock data if parsing failed
             if logs is not None:
-                logs.append({"stage": "Note", "status": "Info", "details": "Returning mock output (output parsing not implemented)"})
+                logs.append({"stage": "Note", "status": "Warning", "details": "Falling back to mock output due to parsing failure"})
             
             # Generate mock output based on expected output or input shape
             if expected_output is not None:
@@ -643,7 +846,8 @@ class PortingEngine:
                 binary = self.compiler.compile(current_code, target, config.compiler_cmd, allow_mock=not config.use_adb)
                 logs.append({"stage": f"Iteration {iteration}", "status": "Compilation Success", "details": f"Binary: {binary}"})
             except Exception as e:
-                logs.append({"stage": f"Iteration {iteration}", "status": "Compilation Failed", "details": str(e)})
+                compilation_error = str(e)
+                logs.append({"stage": f"Iteration {iteration}", "status": "Compilation Failed", "details": compilation_error})
                 
                 # If reference exists and not last iteration, try AI fix
                 if ref_output is not None and iteration < max_iterations - 1:
@@ -653,7 +857,8 @@ class PortingEngine:
                         with open(reference_model_path, 'r') as f:
                             ref_content = f.read()
                         
-                        fixed_code = self.generator.generate(ref_content, target, iteration)
+                        error_feedback = f"COMPILATION ERROR:\n{compilation_error}\n\nFix the C code to compile successfully."
+                        fixed_code = self.generator.generate(ref_content, target, iteration, error_feedback=error_feedback)
                         current_code = fixed_code
                         logs.append({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code version"})
                         continue
@@ -670,7 +875,23 @@ class PortingEngine:
                     actual_output = self.runner.deploy_and_run(binary, input_data, config, expected_output=ref_output, logs=logs)
                     logs.append({"stage": f"Iteration {iteration} (TARGET)", "status": "Complete", "details": f"Output shape: {actual_output.shape} | Values: {actual_output.flatten()[:5].tolist()}"})
                 except Exception as e:
-                    logs.append({"stage": f"Iteration {iteration} (TARGET)", "status": "Execution Failed", "details": str(e)})
+                    execution_error = str(e)
+                    logs.append({"stage": f"Iteration {iteration} (TARGET)", "status": "Execution Failed", "details": execution_error})
+                    
+                    # Try AI fix if not last iteration
+                    if ref_output is not None and iteration < max_iterations - 1:
+                        logs.append({"stage": f"Iteration {iteration}", "status": "Attempting AI Fix", "details": "Asking AI to fix execution error..."})
+                        try:
+                            with open(reference_model_path, 'r') as f:
+                                ref_content = f.read()
+                            
+                            error_feedback = f"EXECUTION ERROR:\n{execution_error}\n\nFix the code to execute successfully on the target device."
+                            fixed_code = self.generator.generate(ref_content, target, iteration + 1, error_feedback=error_feedback)
+                            current_code = fixed_code
+                            logs.append({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code to fix execution error"})
+                            continue
+                        except Exception as fix_error:
+                            logs.append({"stage": f"Iteration {iteration}", "status": "AI Fix Failed", "details": str(fix_error)})
                     continue
                 
                 # Compare with reference if available
@@ -679,7 +900,8 @@ class PortingEngine:
                     
                     # Check shape match
                     if ref_output.shape != actual_output.shape:
-                        logs.append({"stage": f"Iteration {iteration}", "status": "Shape Mismatch", "details": f"Expected {ref_output.shape}, got {actual_output.shape}"})
+                        shape_error = f"Expected {ref_output.shape}, got {actual_output.shape}"
+                        logs.append({"stage": f"Iteration {iteration}", "status": "Shape Mismatch", "details": shape_error})
                         
                         # Try AI fix if not last iteration
                         if iteration < max_iterations - 1:
@@ -689,7 +911,8 @@ class PortingEngine:
                                     ref_content = f.read()
                                 
                                 # Generate new code with error feedback
-                                fixed_code = self.generator.generate(ref_content, target, iteration + 1)
+                                error_feedback = f"OUTPUT SHAPE MISMATCH:\nExpected output shape: {ref_output.shape}\nActual output shape: {actual_output.shape}\n\nThe C code is not producing the correct output shape. Make sure:\n1. You're writing ALL output values to output.bin (not just the first element)\n2. The fwrite() call writes the complete array: fwrite(output_array, sizeof(float), TOTAL_OUTPUT_SIZE, fp)\n3. TOTAL_OUTPUT_SIZE should be the product of all output dimensions"
+                                fixed_code = self.generator.generate(ref_content, target, iteration + 1, error_feedback=error_feedback)
                                 current_code = fixed_code
                                 logs.append({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code to fix shape", "source_preview": fixed_code[:500] + "..." if len(fixed_code) > 500 else fixed_code})
                                 continue
@@ -716,7 +939,8 @@ class PortingEngine:
                             with open(reference_model_path, 'r') as f:
                                 ref_content = f.read()
                             
-                            fixed_code = self.generator.generate(ref_content, target, iteration + 1)
+                            error_feedback = f"OUTPUT VALUE MISMATCH:\nL2 norm difference: {diff:.4f} (threshold: 1e-4)\nExpected output: {ref_output.flatten()[:10]}\nActual output: {actual_output.flatten()[:10]}\n\nThe computation is producing incorrect values. Review the model logic and ensure all operations match the PyTorch reference exactly."
+                            fixed_code = self.generator.generate(ref_content, target, iteration + 1, error_feedback=error_feedback)
                             current_code = fixed_code
                             logs.append({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated improved code version", "source_preview": fixed_code[:500] + "..." if len(fixed_code) > 500 else fixed_code})
                         except Exception as fix_error:
