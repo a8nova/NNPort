@@ -1,4 +1,4 @@
-# NNCompass
+# NNPort
 
 A web application for porting and debugging neural network architectures.
 
