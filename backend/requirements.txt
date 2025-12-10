@@ -3,7 +3,9 @@ uvicorn
 torch
 numpy<2
 python-multipart
-python-multipart
 transformers
 google-generativeai
-openai
+openai  # Supports both v0.x and v1.0+ (code is backward compatible)
+websockets
+paramiko
+python-dotenv

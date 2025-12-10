@@ -1,9 +1,34 @@
 import { useState, useEffect } from 'react'
+import ConnectionConfig from './components/ConnectionConfig'
+import ToolchainConfig from './components/ToolchainConfig'
+import DeviceSelector from './components/DeviceSelector'
 
 function App() {
   const [sourceFile, setSourceFile] = useState(null)
   const [targetType, setTargetType] = useState('DSP')
-  const [deviceConfig, setDeviceConfig] = useState({ mock: false, use_adb: false, adb_device_id: '' })
+  const [deviceConfig, setDeviceConfig] = useState({ 
+    connection_type: 'local',
+    mock: false, 
+    use_adb: false, 
+    adb_device_id: '',
+    remote_work_dir: '/data/local/tmp',
+    toolchain: {
+      compiler_path: 'gcc',
+      sysroot: '',
+      include_paths: [],
+      library_paths: [],
+      compiler_flags: [],
+      linker_flags: [],
+      architecture: 'x86_64',
+      abi: '',
+      endianness: 'little'
+    },
+    compiler_cmd: 'gcc',
+    compute_backend: 'auto',
+    compute_device_type: 'GPU',
+    compute_platform_id: 0,
+    compute_device_id: 0
+  })
   const [inputShape, setInputShape] = useState('1, 10')
   const [logs, setLogs] = useState(null)
   const [loading, setLoading] = useState(false)
@@ -13,6 +38,22 @@ function App() {
   const [activeTab, setActiveTab] = useState('auto') // 'auto' or 'manual'
   const [manualSourceFile, setManualSourceFile] = useState(null)
   const [manualRefFile, setManualRefFile] = useState(null)
+  const [testResult, setTestResult] = useState(null)
+  const [testLoading, setTestLoading] = useState(false)
+  const [maxIterations, setMaxIterations] = useState(3)
+  const [debugInstructions, setDebugInstructions] = useState('')
+  const [recentFiles, setRecentFiles] = useState(() => {
+    const saved = localStorage.getItem('nnport-recent-files')
+    return saved ? JSON.parse(saved) : []
+  })
+
+  const addToRecent = (filename, type) => {
+    const recent = [{ filename, type, timestamp: Date.now() }]
+      .concat(recentFiles.filter(f => f.filename !== filename))
+      .slice(0, 5)
+    setRecentFiles(recent)
+    localStorage.setItem('nnport-recent-files', JSON.stringify(recent))
+  }
 
   // Fetch system status on mount
   useEffect(() => {
@@ -22,7 +63,7 @@ function App() {
       .catch(err => console.error('Failed to fetch system status:', err))
   }, [])
 
-  const handleUploadGeneric = async (file, setter) => {
+  const handleUploadGeneric = async (file, setter, type) => {
     if (!file) return
     const formData = new FormData()
     formData.append('file', file)
@@ -32,6 +73,7 @@ function App() {
       if (!res.ok) throw new Error('Upload failed')
       const data = await res.json()
       setter(data.filename)
+      if (type) addToRecent(data.filename, type)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -52,8 +94,9 @@ function App() {
           source_filename: sourceFile,
           target_type: targetType,
           device_config: deviceConfig,
-          max_iterations: 3,
+          max_iterations: maxIterations,
           input_shape: inputShape.split(',').map(n => parseInt(n.trim())),
+          debug_instructions: debugInstructions,
         }),
       })
       if (!res.ok) {
@@ -61,10 +104,33 @@ function App() {
         throw new Error(errData.detail || 'Porting failed')
       }
       const data = await res.json()
-      setLogs(data.logs)
+      
+      if (data.job_id) {
+        // Connect to WebSocket for real-time updates
+        const wsUrl = `ws://localhost:8000/ws/port/${data.job_id}`
+        const ws = new WebSocket(wsUrl)
+        
+        ws.onopen = () => console.log('WebSocket connected')
+        ws.onmessage = (event) => {
+          const message = JSON.parse(event.data)
+          if (message.type === 'job_complete') {
+            setLogs(message.logs || [])
+            setLoading(false)
+            ws.close()
+          } else {
+            setLogs(prevLogs => [...(prevLogs || []), message])
+          }
+        }
+        ws.onerror = () => {
+          setError('WebSocket connection error')
+          setLoading(false)
+        }
+      } else {
+        setLogs(data.logs)
+        setLoading(false)
+      }
     } catch (err) {
       setError(err.message)
-    } finally {
       setLoading(false)
     }
   }
@@ -74,7 +140,7 @@ function App() {
     try {
       setLoading(true)
       setError(null)
-      setLogs(null)
+      setLogs([])
       const res = await fetch('/verify', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -84,6 +150,8 @@ function App() {
           target_type: targetType,
           device_config: deviceConfig,
           input_shape: inputShape.split(',').map(n => parseInt(n.trim())),
+          max_iterations: maxIterations,
+          debug_instructions: debugInstructions,
         }),
       })
       if (!res.ok) {
@@ -91,11 +159,123 @@ function App() {
         throw new Error(err.detail || 'Verification failed')
       }
       const data = await res.json()
-      setLogs(data.logs)
+      
+      if (data.job_id) {
+        // Connect to WebSocket for real-time updates
+        const wsUrl = `ws://localhost:8000/ws/port/${data.job_id}`
+        const ws = new WebSocket(wsUrl)
+        
+        ws.onopen = () => {
+          console.log('✅ WebSocket connected for job:', data.job_id)
+        }
+        
+        ws.onmessage = (event) => {
+          const message = JSON.parse(event.data)
+          console.log('📨 Received WebSocket message:', message)
+          
+          if (message.type === 'job_complete') {
+            console.log('✅ Job complete, final logs:', message.logs)
+            setLogs(message.logs || [])
+            setLoading(false)
+            ws.close()
+          } else {
+            // It's a log entry, append it
+            console.log('📝 Appending log entry:', message)
+            setLogs(prevLogs => {
+              const newLogs = [...(prevLogs || []), message]
+              console.log('📊 Updated logs array length:', newLogs.length)
+              return newLogs
+            })
+          }
+        }
+        
+        ws.onerror = (error) => {
+          console.error('❌ WebSocket error:', error)
+          setError('WebSocket connection error')
+          setLoading(false)
+        }
+        
+        ws.onclose = () => {
+          console.log('🔌 WebSocket closed')
+        }
+      } else {
+        setLogs(data.logs)
+        setLoading(false)
+      }
     } catch (err) {
       setError(err.message)
-    } finally {
       setLoading(false)
+    }
+  }
+
+  const handleTestConnection = async () => {
+    try {
+      setTestLoading(true)
+      setTestResult(null)
+      const res = await fetch('/test-connection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(deviceConfig),
+      })
+      const data = await res.json()
+      setTestResult(data)
+    } catch (err) {
+      setTestResult({ success: false, message: 'Test failed', details: err.message })
+    } finally {
+      setTestLoading(false)
+    }
+  }
+
+  const handleTestToolchain = async () => {
+    try {
+      setTestLoading(true)
+      setTestResult(null)
+      const res = await fetch('/test-toolchain', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(deviceConfig),
+      })
+      const data = await res.json()
+      setTestResult(data)
+    } catch (err) {
+      setTestResult({ success: false, message: 'Test failed', details: err.message })
+    } finally {
+      setTestLoading(false)
+    }
+  }
+
+  const handleExportConfig = () => {
+    // Generate smart filename
+    const toolchainName = deviceConfig.toolchain?.compiler_path?.split('/').pop()?.split('-')[0] || 'unknown'
+    const arch = deviceConfig.toolchain?.architecture || 'x64'
+    const connection = deviceConfig.connection_type || 'local'
+    const timestamp = new Date().toISOString().split('T')[0]
+    const filename = `nnport-${toolchainName}-${arch}-${connection}-${timestamp}.json`
+    
+    const json = JSON.stringify(deviceConfig, null, 2)
+    const blob = new Blob([json], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const handleImportConfig = (event) => {
+    const file = event.target.files[0]
+    if (file) {
+      const reader = new FileReader()
+      reader.onload = (e) => {
+        try {
+          const imported = JSON.parse(e.target.result)
+          setDeviceConfig(imported)
+          alert('Configuration loaded successfully!')
+        } catch (error) {
+          alert('Failed to import config: ' + error.message)
+        }
+      }
+      reader.readAsText(file)
     }
   }
 
@@ -104,6 +284,38 @@ function App() {
       {/* Sidebar Configuration */}
       <aside className="sidebar">
         <h1 className="section-title">NNPort</h1>
+
+        {/* Config Management */}
+        <div style={{ marginBottom: '1.5rem', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
+          <button 
+            onClick={handleExportConfig}
+            style={{ fontSize: '0.85rem', padding: '0.5rem', background: '#4A90E2', border: 'none', color: 'white', cursor: 'pointer', borderRadius: 'var(--radius)' }}
+          >
+            💾 Export Config
+          </button>
+          <label style={{ 
+            fontSize: '0.85rem', 
+            padding: '0.5rem', 
+            borderRadius: 'var(--radius)',
+            cursor: 'pointer',
+            textAlign: 'center',
+            background: '#4A90E2',
+            border: 'none',
+            color: 'white',
+            margin: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+          }}>
+            📂 Import Config
+            <input
+              type="file"
+              accept=".json"
+              onChange={handleImportConfig}
+              style={{ display: 'none' }}
+            />
+          </label>
+        </div>
 
         {/* Tab Switcher */}
         <div style={{ display: 'flex', marginBottom: '1.5rem', borderBottom: '1px solid var(--border)' }}>
@@ -145,9 +357,28 @@ function App() {
             <input
               type="file"
               accept=".py"
-              onChange={(e) => handleUploadGeneric(e.target.files[0], setSourceFile)}
+              onChange={(e) => handleUploadGeneric(e.target.files[0], setSourceFile, 'py')}
             />
             {sourceFile && <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--success)' }}>✓ {sourceFile}</div>}
+            {recentFiles.filter(f => f.type === 'py').slice(0, 3).length > 0 && (
+              <div style={{ marginTop: '0.5rem', fontSize: '0.75rem' }}>
+                <div style={{ color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>Recent:</div>
+                {recentFiles.filter(f => f.type === 'py').slice(0, 3).map((f, i) => (
+                  <div 
+                    key={i} 
+                    onClick={() => setSourceFile(f.filename)}
+                    style={{ 
+                      cursor: 'pointer', 
+                      color: sourceFile === f.filename ? 'var(--success)' : 'var(--accent)', 
+                      padding: '0.15rem 0',
+                      textDecoration: sourceFile === f.filename ? 'underline' : 'none'
+                    }}
+                  >
+                    • {f.filename}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         ) : (
           <>
@@ -156,9 +387,28 @@ function App() {
               <input
                 type="file"
                 accept=".cpp,.c,.cl,.cu"
-                onChange={(e) => handleUploadGeneric(e.target.files[0], setManualSourceFile)}
+                onChange={(e) => handleUploadGeneric(e.target.files[0], setManualSourceFile, 'cpp')}
               />
               {manualSourceFile && <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--success)' }}>✓ {manualSourceFile}</div>}
+              {recentFiles.filter(f => f.type === 'cpp').slice(0, 3).length > 0 && (
+                <div style={{ marginTop: '0.5rem', fontSize: '0.75rem' }}>
+                  <div style={{ color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>Recent:</div>
+                  {recentFiles.filter(f => f.type === 'cpp').slice(0, 3).map((f, i) => (
+                    <div 
+                      key={i} 
+                      onClick={() => setManualSourceFile(f.filename)}
+                      style={{ 
+                        cursor: 'pointer', 
+                        color: manualSourceFile === f.filename ? 'var(--success)' : 'var(--accent)', 
+                        padding: '0.15rem 0',
+                        textDecoration: manualSourceFile === f.filename ? 'underline' : 'none'
+                      }}
+                    >
+                      • {f.filename}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             <div className="control-group">
@@ -166,9 +416,28 @@ function App() {
               <input
                 type="file"
                 accept=".py"
-                onChange={(e) => handleUploadGeneric(e.target.files[0], setManualRefFile)}
+                onChange={(e) => handleUploadGeneric(e.target.files[0], setManualRefFile, 'py')}
               />
               {manualRefFile && <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--success)' }}>✓ {manualRefFile}</div>}
+              {recentFiles.filter(f => f.type === 'py').slice(0, 3).length > 0 && (
+                <div style={{ marginTop: '0.5rem', fontSize: '0.75rem' }}>
+                  <div style={{ color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>Recent:</div>
+                  {recentFiles.filter(f => f.type === 'py').slice(0, 3).map((f, i) => (
+                    <div 
+                      key={i} 
+                      onClick={() => setManualRefFile(f.filename)}
+                      style={{ 
+                        cursor: 'pointer', 
+                        color: manualRefFile === f.filename ? 'var(--success)' : 'var(--accent)', 
+                        padding: '0.15rem 0',
+                        textDecoration: manualRefFile === f.filename ? 'underline' : 'none'
+                      }}
+                    >
+                      • {f.filename}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </>
         )}
@@ -185,40 +454,6 @@ function App() {
           </select>
         </div>
 
-        {/* ADB Configuration */}
-        <div style={{ marginBottom: '1.5rem', border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: '1rem' }}>
-          <div style={{ fontSize: '0.875rem', fontWeight: '600', marginBottom: '0.5rem', color: 'var(--text-primary)' }}>Device Configuration</div>
-
-          <div style={{ display: 'flex', alignItems: 'center', marginBottom: '0.5rem' }}>
-            <input
-              type="checkbox"
-              id="useAdb"
-              checked={deviceConfig.use_adb}
-              onChange={(e) => setDeviceConfig({ ...deviceConfig, use_adb: e.target.checked })}
-              style={{ width: 'auto', marginRight: '0.5rem' }}
-            />
-            <label htmlFor="useAdb" style={{ fontSize: '0.875rem' }}>Use ADB (Android Device)</label>
-          </div>
-
-          {deviceConfig.use_adb && (
-            <div style={{ marginBottom: '0.5rem' }}>
-              <label className="control-label" style={{ fontSize: '0.8rem' }}>ADB Device ID</label>
-              <input
-                type="text"
-                placeholder="Serial (optional)"
-                value={deviceConfig.adb_device_id || ''}
-                onChange={(e) => setDeviceConfig({ ...deviceConfig, adb_device_id: e.target.value })}
-              />
-            </div>
-          )}
-          
-          {!deviceConfig.use_adb && (
-            <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.5rem' }}>
-              Running locally on this machine
-            </div>
-          )}
-        </div>
-
         <div className="control-group">
           <label className="control-label">Input Shape (comma separated)</label>
           <input
@@ -229,21 +464,171 @@ function App() {
           />
         </div>
 
+        {/* Vibe Debugging Configuration */}
+        <div style={{ 
+          marginBottom: '1.5rem', 
+          border: '2px solid #9B59B6', 
+          borderRadius: 'var(--radius)', 
+          padding: '1rem',
+          background: 'rgba(155, 89, 182, 0.05)'
+        }}>
+          <div style={{ 
+            fontSize: '0.9rem', 
+            fontWeight: '700', 
+            color: '#9B59B6', 
+            marginBottom: '0.75rem',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem'
+          }}>
+            🔄 Iterative Debugging
+          </div>
+
+          <div className="control-group" style={{ marginBottom: '0.75rem' }}>
+            <label className="control-label">Max Iterations</label>
+            <input
+              type="number"
+              min="1"
+              max="10"
+              value={maxIterations}
+              onChange={(e) => setMaxIterations(parseInt(e.target.value) || 3)}
+              style={{ width: '100%' }}
+            />
+            <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
+              Number of cross-compile → deploy → test → fix cycles (1-10)
+            </div>
+          </div>
+
+          <div className="control-group">
+            <label className="control-label">Debug Instructions (optional)</label>
+            <textarea
+              rows="4"
+              placeholder="Guide the AI debugging process...&#10;&#10;Example:&#10;- Focus on fixing precision issues&#10;- The output is off by a factor of 2&#10;- Check memory alignment on target device"
+              value={debugInstructions}
+              onChange={(e) => setDebugInstructions(e.target.value)}
+              style={{ 
+                width: '100%', 
+                fontSize: '0.85rem',
+                fontFamily: 'monospace',
+                resize: 'vertical'
+              }}
+            />
+            <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
+              Additional context to help AI fix mismatches between host and target
+            </div>
+          </div>
+        </div>
+
+        {/* Target Device Configuration */}
+        <div style={{ 
+          border: '2px solid #50C878', 
+          borderRadius: 'var(--radius)', 
+          padding: '0.75rem',
+          marginBottom: '1rem',
+          background: 'rgba(80, 200, 120, 0.03)'
+        }}>
+          <div style={{ 
+            fontSize: '0.85rem', 
+            fontWeight: '700', 
+            color: '#50C878', 
+            marginBottom: '0.5rem',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem'
+          }}>
+            🎯 TARGET DEVICE
+          </div>
+          <ConnectionConfig 
+            config={deviceConfig} 
+            onChange={setDeviceConfig} 
+          />
+        </div>
+
+        {/* Host Toolchain Configuration */}
+        <div style={{ 
+          border: '2px solid #4A90E2', 
+          borderRadius: 'var(--radius)', 
+          padding: '0.75rem',
+          marginBottom: '1rem',
+          background: 'rgba(74, 144, 226, 0.03)'
+        }}>
+          <div style={{ 
+            fontSize: '0.85rem', 
+            fontWeight: '700', 
+            color: '#4A90E2', 
+            marginBottom: '0.5rem',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.5rem'
+          }}>
+            ⚙️ HOST TOOLCHAIN (Cross-Compilation)
+          </div>
+          <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.75rem' }}>
+            Compiler and tools on your local machine used to build code for target
+          </div>
+          <ToolchainConfig 
+            config={deviceConfig} 
+            onChange={setDeviceConfig} 
+          />
+          
+          <DeviceSelector
+            targetType={targetType}
+            config={deviceConfig}
+            onChange={setDeviceConfig}
+          />
+        </div>
+
+        {/* Testing Buttons */}
+        <div style={{ marginBottom: '1.5rem', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.5rem' }}>
+          <button
+            onClick={handleTestConnection}
+            disabled={testLoading}
+            style={{ fontSize: '0.85rem', padding: '0.5rem' }}
+          >
+            {testLoading ? 'Testing...' : 'Test Connection'}
+          </button>
+          <button
+            onClick={handleTestToolchain}
+            disabled={testLoading}
+            style={{ fontSize: '0.85rem', padding: '0.5rem' }}
+          >
+            {testLoading ? 'Testing...' : 'Test Toolchain'}
+          </button>
+        </div>
+
+        {testResult && (
+          <div style={{ 
+            marginBottom: '1.5rem', 
+            padding: '0.75rem', 
+            borderRadius: 'var(--radius)',
+            background: testResult.success ? 'rgba(0, 255, 0, 0.1)' : 'rgba(255, 0, 0, 0.1)',
+            border: `1px solid ${testResult.success ? 'var(--success)' : 'var(--error)'}`,
+            fontSize: '0.85rem'
+          }}>
+            <div style={{ fontWeight: '600', marginBottom: '0.25rem', color: testResult.success ? 'var(--success)' : 'var(--error)' }}>
+              {testResult.message}
+            </div>
+            <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+              {testResult.details}
+            </div>
+          </div>
+        )}
+
         {activeTab === 'auto' ? (
           <button
             onClick={handlePort}
             disabled={!sourceFile || loading}
-            style={{ width: '100%' }}
+            style={{ width: '100%', padding: '0.75rem', fontSize: '1rem', fontWeight: '600' }}
           >
-            {loading ? 'Running Porting Loop...' : 'Start Porting'}
+            {loading ? `🔄 Vibing... (0/${maxIterations})` : '🚀 Start Vibe Debugging'}
           </button>
         ) : (
           <button
             onClick={handleVerify}
             disabled={!manualSourceFile || !manualRefFile || loading}
-            style={{ width: '100%' }}
+            style={{ width: '100%', padding: '0.75rem', fontSize: '1rem', fontWeight: '600' }}
           >
-            {loading ? 'Vibing...' : 'Vibe Debug'}
+            {loading ? `🔄 Vibing... (0/${maxIterations})` : '🔧 Vibe Debug Manual Code'}
           </button>
         )}
 
@@ -294,56 +679,116 @@ function App() {
               Upload a model and select target hardware to begin vibe debuging.
             </div>
           ) : (
-            <div className="logs-container">
-              {loading && !logs && <div>Initializing...</div>}
-              {logs && logs.map((log, i) => (
-                <div key={i} style={{ marginBottom: '1rem', borderLeft: log.status === 'Success' ? '3px solid var(--success)' : '3px solid var(--border)', paddingLeft: '1rem' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <div>
-                      <span style={{ fontWeight: '600', color: 'var(--accent)' }}>{log.stage}</span>
-                      <span style={{
-                        marginLeft: '1rem',
-                        color: log.status === 'Success' ? 'var(--success)' :
-                          log.status === 'Failed' ? 'var(--error)' : 'var(--text-primary)'
-                      }}>{log.status}</span>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+              {/* HOST Side */}
+              <div>
+                <h3 style={{ fontSize: '0.9rem', marginBottom: '1rem', color: 'var(--accent)' }}>🖥️ HOST (Reference)</h3>
+                <div className="logs-container">
+                  {loading && !logs && <div>Initializing...</div>}
+                  {logs && logs.filter(log => log.stage?.includes('HOST') || log.stage?.includes('Reference') || log.stage?.includes('Initialization') || log.stage?.includes('Source Code')).map((log, i) => (
+                    <div key={i} style={{ marginBottom: '1rem', borderLeft: log.status === 'Success' ? '3px solid var(--success)' : '3px solid var(--border)', paddingLeft: '1rem' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div>
+                          <span style={{ fontWeight: '600', color: 'var(--accent)' }}>{log.stage}</span>
+                          <span style={{
+                            marginLeft: '1rem',
+                            color: log.status === 'Success' ? 'var(--success)' :
+                              log.status === 'Failed' ? 'var(--error)' : 'var(--text-primary)'
+                          }}>{log.status}</span>
+                        </div>
+                        {log.status === 'Success' && log.source_preview && (
+                          <button
+                            onClick={() => {
+                              const blob = new Blob([log.source_preview], { type: 'text/plain' });
+                              const url = URL.createObjectURL(blob);
+                              const a = document.createElement('a');
+                              a.href = url;
+                              a.download = `ported_model_${targetType}.cpp`;
+                              a.click();
+                            }}
+                            style={{
+                              fontSize: '0.75rem',
+                              padding: '0.25rem 0.5rem',
+                              background: 'var(--accent)',
+                              border: 'none',
+                              borderRadius: 'var(--radius)',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            Download
+                          </button>
+                        )}
+                      </div>
+                      {log.details && (
+                        <div style={{ marginTop: '0.5rem', fontSize: '0.85rem', color: 'var(--text-secondary)', whiteSpace: 'pre-wrap' }}>
+                          {log.details}
+                        </div>
+                      )}
                     </div>
-                    {log.status === 'Success' && log.source_preview && (
-                      <button
-                        onClick={() => {
-                          const blob = new Blob([log.source_preview], { type: 'text/plain' });
-                          const url = URL.createObjectURL(blob);
-                          const a = document.createElement('a');
-                          a.href = url;
-                          a.download = `ported_model_${targetType}.cpp`;
-                          a.click();
-                        }}
-                        style={{
-                          fontSize: '0.75rem',
-                          padding: '0.25rem 0.5rem',
-                          height: 'auto',
-                          background: 'var(--accent)',
-                        }}
-                      >
-                        Download Code
-                      </button>
-                    )}
-                  </div>
-                  {log.details && <div style={{ fontSize: '0.875rem', marginTop: '0.25rem', color: 'var(--text-secondary)' }}>{log.details}</div>}
-                  {log.source_preview && (
-                    <pre style={{
-                      fontSize: '0.75rem',
-                      backgroundColor: 'rgba(0,0,0,0.3)',
-                      padding: '0.5rem',
-                      borderRadius: '4px',
-                      marginTop: '0.5rem',
-                      overflowX: 'auto',
-                      maxHeight: '300px'
-                    }}>
-                      {log.source_preview}
-                    </pre>
-                  )}
+                  ))}
                 </div>
-              ))}
+              </div>
+
+              {/* TARGET Side */}
+              <div>
+                <h3 style={{ fontSize: '0.9rem', marginBottom: '1rem', color: 'var(--accent)' }}>📱 TARGET (Device)</h3>
+                <div className="logs-container">
+                  {logs && logs.filter(log => log.stage?.includes('TARGET') || log.stage?.includes('Iteration') || log.stage?.includes('Compil') || log.stage?.includes('Result')).map((log, i) => (
+                    <div key={i} style={{ marginBottom: '1rem', borderLeft: log.status === 'Success' ? '3px solid var(--success)' : '3px solid var(--border)', paddingLeft: '1rem' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <div>
+                          <span style={{ fontWeight: '600', color: 'var(--accent)' }}>{log.stage}</span>
+                          <span style={{
+                            marginLeft: '1rem',
+                            color: log.status === 'Success' ? 'var(--success)' :
+                              log.status === 'Failed' ? 'var(--error)' : 'var(--text-primary)'
+                          }}>{log.status}</span>
+                        </div>
+                        {log.status === 'Success' && log.source_preview && (
+                          <button
+                            onClick={() => {
+                              const blob = new Blob([log.source_preview], { type: 'text/plain' });
+                              const url = URL.createObjectURL(blob);
+                              const a = document.createElement('a');
+                              a.href = url;
+                              a.download = `ported_model_${targetType}.cpp`;
+                              a.click();
+                            }}
+                            style={{
+                              fontSize: '0.75rem',
+                              padding: '0.25rem 0.5rem',
+                              background: 'var(--accent)',
+                              border: 'none',
+                              borderRadius: 'var(--radius)',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            Download
+                          </button>
+                        )}
+                      </div>
+                      {log.details && (
+                        <div style={{ marginTop: '0.5rem', fontSize: '0.85rem', color: 'var(--text-secondary)', whiteSpace: 'pre-wrap' }}>
+                          {log.details}
+                        </div>
+                      )}
+                      {log.source_preview && (
+                        <pre style={{
+                          fontSize: '0.75rem',
+                          backgroundColor: 'rgba(0,0,0,0.3)',
+                          padding: '0.5rem',
+                          borderRadius: '4px',
+                          marginTop: '0.5rem',
+                          overflowX: 'auto',
+                          maxHeight: '300px'
+                        }}>
+                          {log.source_preview}
+                        </pre>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
         </div>
