@@ -1,9 +1,10 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, WebSocket, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 import shutil
 import os
+import json
 import tempfile
 import platform
 import asyncio
@@ -84,14 +85,24 @@ async def get_system_status():
         android_clang = compiler._get_android_clang(compiler.ndk_path)
         status["ndk"]["compiler"] = android_clang if android_clang else "Not found"
     
-    # Check ADB devices
+    # Check ADB devices using proper discovery
     try:
-        result = subprocess.run(["adb", "devices"], capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            status["adb"]["available"] = True
-            lines = result.stdout.strip().split('\n')[1:]  # Skip header
-            devices = [line.split()[0] for line in lines if line.strip() and '\tdevice' in line]
-            status["adb"]["devices"] = devices
+        from backend.toolchain_discovery import ADBDiscovery
+        adb_path = ADBDiscovery.find_adb()
+        if adb_path:
+            result = subprocess.run([adb_path, "devices"], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                status["adb"]["available"] = True
+                lines = result.stdout.strip().split('\n')[1:]  # Skip header
+                devices = []
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] == 'device':
+                        devices.append(parts[0])
+                status["adb"]["devices"] = devices
     except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
     
@@ -103,6 +114,68 @@ async def upload_file(file: UploadFile = File(...)):
     with open(file_location, "wb+") as file_object:
         shutil.copyfileobj(file.file, file_object)
     return {"filename": file.filename, "location": file_location}
+
+@app.post("/upload-project")
+async def upload_project(
+    folder_name: str = Form(...),
+    files: List[UploadFile] = File(...)
+):
+    """
+    Upload an entire GPU project folder.
+    Preserves directory structure and stores all files.
+    """
+    # Create project directory
+    project_dir = os.path.join(UPLOAD_DIR, folder_name)
+    os.makedirs(project_dir, exist_ok=True)
+    
+    uploaded_files = []
+    main_file = None
+    
+    for file in files:
+        # Get relative path from filename (which includes path from webkitRelativePath)
+        relative_path = file.filename
+        
+        # Remove the top-level folder name if it's duplicated
+        parts = relative_path.split('/')
+        if len(parts) > 1 and parts[0] == folder_name:
+            relative_path = '/'.join(parts[1:])
+        
+        # Create full path
+        file_path = os.path.join(project_dir, relative_path)
+        
+        # Create subdirectories if needed
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        
+        # Save file
+        with open(file_path, "wb+") as file_object:
+            shutil.copyfileobj(file.file, file_object)
+        
+        uploaded_files.append(f"{folder_name}/{relative_path}")
+        
+        # Identify main file (first .cpp, .cu, or .cl file)
+        if main_file is None:
+            ext = relative_path.split('.')[-1].lower()
+            if ext in ['cpp', 'cu', 'cl', 'c']:
+                main_file = f"{folder_name}/{relative_path}"
+    
+    # Create a project manifest file
+    manifest_path = os.path.join(project_dir, ".project_manifest.json")
+    manifest = {
+        "folder_name": folder_name,
+        "files": uploaded_files,
+        "main_file": main_file,
+        "upload_time": str(os.path.getmtime(project_dir))
+    }
+    
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    
+    return {
+        "folder_name": folder_name,
+        "files": uploaded_files,
+        "main_file": main_file,
+        "file_count": len(uploaded_files)
+    }
 
 @app.post("/test-connection")
 async def test_connection(config: DeviceConfig):
@@ -184,15 +257,36 @@ async def discover_toolchains():
     try:
         discovery = ToolchainDiscovery()
         results = discovery.discover_all()
+        
+        # Ensure results is JSON serializable
+        if results is None:
+            results = {}
+        
+        # Add default fields if missing
+        if "host_info" not in results:
+            results["host_info"] = {
+                "os": platform.system(),
+                "architecture": platform.machine()
+            }
+        
         return results
     except Exception as e:
+        print(f"❌ Toolchain discovery error: {e}")
+        import traceback
+        traceback.print_exc()
+        
         return {
             "error": str(e),
             "host_info": {
                 "os": platform.system(),
                 "architecture": platform.machine()
             },
-            "toolchains": [],
+            "toolchains": {
+                "native": [],
+                "cross": [],
+                "android_ndk": [],
+                "embedded": []
+            },
             "gpu_sdks": {},
             "ndk": None
         }
@@ -232,6 +326,57 @@ async def discover_adb():
     except Exception as e:
         return {
             "found": False,
+            "error": str(e)
+        }
+
+@app.get("/discover/opencl")
+async def discover_opencl():
+    """Discover or auto-setup OpenCL for cross-compilation"""
+    try:
+        discovery = ToolchainDiscovery()
+        
+        # This will auto-download headers if needed
+        sdks = discovery.discover_gpu_sdks()
+        opencl = sdks.get("opencl", {})
+        
+        headers_available = opencl.get("headers_path") is not None
+        headers_source = opencl.get("headers_source", "none")
+        
+        # Pull libraries from connected devices
+        devices = opencl.get("available_devices", [])
+        
+        return {
+            "headers_available": headers_available,
+            "headers_source": headers_source,  # "system", "downloaded", "ndk"
+            "headers_path": opencl.get("headers_path"),
+            "devices": devices,  # List of devices with OpenCL libraries
+            "message": "OpenCL headers downloaded" if headers_source == "downloaded" else None
+        }
+    except Exception as e:
+        return {
+            "headers_available": False,
+            "headers_source": "none",
+            "headers_path": None,
+            "devices": [],
+            "error": str(e)
+        }
+
+@app.post("/discover/opencl/refresh")
+async def refresh_opencl_devices():
+    """Re-scan for connected devices and pull OpenCL libraries"""
+    try:
+        discovery = ToolchainDiscovery()
+        devices = discovery.pull_opencl_from_devices()
+        
+        return {
+            "devices": devices,
+            "count": len(devices),
+            "message": f"Found OpenCL on {len(devices)} device(s)"
+        }
+    except Exception as e:
+        return {
+            "devices": [],
+            "count": 0,
             "error": str(e)
         }
 

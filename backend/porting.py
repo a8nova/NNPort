@@ -1,5 +1,6 @@
 import time
 import os
+import json
 import uuid
 import shutil
 import subprocess
@@ -47,10 +48,11 @@ class CodeGenerator:
         else:
              self.gemini_model = None
 
-    def generate(self, original_model_source: str, target: TargetType, iteration: int, error_feedback: str = None, debug_instructions: str = "", device_config: DeviceConfig = None) -> str:
+    def generate(self, original_model_source: str, target: TargetType, iteration: int, error_feedback: str = None, debug_instructions: str = "", device_config: DeviceConfig = None, project_context: dict = None) -> str:
         """
         Generates code for the target architecture.
         Prioritizes OpenAI (GPT-4o), falls back to Gemini, then Mock.
+        Supports full project context for multi-file GPU projects.
         """
         
         error_context = ""
@@ -71,6 +73,29 @@ USER DEBUGGING GUIDANCE:
 Take this guidance into account when generating or fixing the code.
 """
         
+        project_info = ""
+        if project_context:
+            files_list = "\n".join([f"  - {path}" for path in project_context["files"].keys()])
+            project_info = f"""
+PROJECT CONTEXT:
+This code is part of a multi-file GPU project: {project_context["folder_name"]}
+
+Files in project:
+{files_list}
+
+You have access to all these files. When fixing errors, consider:
+1. Dependencies between files (headers, includes)
+2. Shared data structures and types
+3. Function definitions across files
+4. Build order and linking requirements
+
+Main entry point: {project_context.get("main_file", "unknown")}
+
+Full file contents:
+"""
+            for path, content in project_context["files"].items():
+                project_info += f"\n--- {path} ---\n{content}\n"
+        
         device_context = ""
         if device_config and target in [TargetType.OPENCL, TargetType.CUDA]:
             if device_config.compute_backend != "auto":
@@ -87,7 +112,74 @@ When generating OpenCL/CUDA code:
 3. Include proper device selection in the runtime code
 """
         
-        prompt = f"""
+        # Different prompts for OpenCL vs other targets
+        if target == TargetType.OPENCL:
+            prompt = f"""
+You are an expert AI compiler engineer specialized in porting PyTorch models to OpenCL for GPU execution.
+Your task is to port the following PyTorch model to OpenCL, generating TWO separate files:
+
+Context:
+- Iteration: {iteration} (0=Initial Draft, 1=Refinement, 2=Optimization/Final)
+- Source Model:
+```python
+{original_model_source}
+```
+{error_context}
+{user_guidance}
+{project_info}
+{device_context}
+
+Requirements:
+1. Generate TWO separate code blocks marked with "/* HOST_CODE */" and "/* KERNEL_CODE */"
+2. HOST CODE (C++):
+   - Include <CL/cl.h> and OpenCL API calls
+   - Use ONLY C standard library: <stdio.h>, <stdlib.h>, <string.h>, <math.h>
+   - DO NOT use <iostream>, <vector>, <string> or other C++ STL headers
+   - Use printf() for output, NOT cout
+   - Use malloc/free, NOT new/delete
+   - Read input from "input.bin" file (float32 binary format)
+   - Load kernel source from "kernel.cl" file using fopen/fread
+   - Set up OpenCL context, queue, buffers, and kernel
+   - Execute kernel on GPU
+   - Read results back from GPU
+   - Write COMPLETE output array to "output.bin" using fwrite()
+   - CRITICAL: Print detailed GPU initialization logs using printf():
+     * Print number of platforms found
+     * Print platform name/vendor for selected platform
+     * Print number of devices found
+     * Print device name/type for selected device
+     * Print "Building kernel..." before clBuildProgram
+     * Print "Kernel compiled successfully" or build errors after clBuildProgram
+     * Print "Executing kernel on GPU..." before clEnqueueNDRangeKernel
+     * Print "Execution complete" after clFinish
+     * Print final output values
+   - Add error checking and print OpenCL error codes if any operation fails
+3. KERNEL CODE (OpenCL C):
+   - Pure OpenCL kernel functions only
+   - Use __kernel, __global, get_global_id(), etc.
+   - Implement the actual computation that runs on GPU
+4. File loading pattern for host code:
+```cpp
+FILE* fp = fopen("kernel.cl", "r");
+fseek(fp, 0, SEEK_END);
+size_t size = ftell(fp);
+rewind(fp);
+char* kernel_source = (char*)malloc(size + 1);
+fread(kernel_source, 1, size, fp);
+kernel_source[size] = '\\0';
+fclose(fp);
+```
+
+Generate the code now in this format:
+/* HOST_CODE */
+<C++ host code here>
+/* KERNEL_CODE */
+<OpenCL kernel code here>
+
+Do not wrap in markdown code blocks, just return raw code.
+"""
+        else:
+            prompt = f"""
 You are an expert AI compiler engineer specialized in porting PyTorch models to high-performance hardware targets.
 Your task is to port the following PyTorch model content to {target.value}.
 
@@ -157,9 +249,16 @@ Generate the code now. Do not wrap in markdown code blocks, just return raw code
                         ]
                     )
                     code = response.choices[0].message.content
+                
                 # Strip markdown and sanitize code
-                code = self._sanitize_code(code)
-                return code
+                code = self._sanitize_code(code, target)
+                
+                # For OpenCL, parse and return dict with host and kernel code
+                if target == TargetType.OPENCL:
+                    return self._parse_opencl_response(code)
+                else:
+                    return {"host_code": code, "kernel_code": None}
+                
             except Exception as e:
                 print(f"OpenAI Error: {e}")
                 pass # Fallback
@@ -169,21 +268,53 @@ Generate the code now. Do not wrap in markdown code blocks, just return raw code
             try:
                 response = self.gemini_model.generate_content(prompt)
                 code = response.text
-                # Remove OpenCL/CUDA headers that would cause compilation errors
-                code = self._sanitize_code(code)
-                return code
+                
+                # Strip markdown and sanitize code
+                code = self._sanitize_code(code, target)
+                
+                # For OpenCL, parse and return dict with host and kernel code
+                if target == TargetType.OPENCL:
+                    return self._parse_opencl_response(code)
+                else:
+                    return {"host_code": code, "kernel_code": None}
+                
             except Exception as e:
                  print(f"Gemini Error: {e}")
                  pass
 
-        return f"// ERROR: No API Keys available (OpenAI or Gemini).\n// Please set OPENAI_API_KEY to use AI code generation.\n// Mocking fallback for now...\n" + self._get_mock_template(original_model_source, target, iteration)
+        # Fallback mock
+        mock_code = f"// ERROR: No API Keys available (OpenAI or Gemini).\n// Please set OPENAI_API_KEY to use AI code generation.\n// Mocking fallback for now...\n" + self._get_mock_template(original_model_source, target, iteration)
+        return {"host_code": mock_code, "kernel_code": None}
     
-    def _sanitize_code(self, code: str) -> str:
+    def _parse_opencl_response(self, code: str) -> Dict[str, str]:
+        """Parse OpenCL response into host_code and kernel_code"""
+        # Look for markers
+        if '/* HOST_CODE */' in code and '/* KERNEL_CODE */' in code:
+            parts = code.split('/* KERNEL_CODE */')
+            host_part = parts[0].replace('/* HOST_CODE */', '').strip()
+            kernel_part = parts[1].strip()
+            return {
+                "host_code": host_part,
+                "kernel_code": kernel_part
+            }
+        else:
+            # Fallback: treat entire code as host code
+            print("Warning: Could not find OpenCL markers, treating as single file")
+            return {
+                "host_code": code,
+                "kernel_code": None
+            }
+    
+    def _sanitize_code(self, code: str, target: TargetType = None) -> str:
         """Remove problematic includes and C++ syntax that would prevent compilation"""
         import re
         
         # First strip markdown
         code = self._strip_markdown(code)
+        
+        # For OpenCL target, don't sanitize - allow OpenCL headers and C++ features
+        if target == TargetType.OPENCL:
+            return code
         
         original_code = code
         
@@ -225,7 +356,7 @@ Generate the code now. Do not wrap in markdown code blocks, just return raw code
         return '\n'.join(sanitized)
     
     def _strip_markdown(self, code: str) -> str:
-        """Remove markdown code block markers from generated code"""
+        """Remove markdown code block markers and explanatory text from generated code"""
         import re
         
         # Remove opening code fence (```c, ```cpp, ```C, etc.)
@@ -244,7 +375,44 @@ Generate the code now. Do not wrap in markdown code blocks, just return raw code
                 continue
             lines.append(line)
         
-        return '\n'.join(lines)
+        code = '\n'.join(lines)
+        
+        # CRITICAL: Remove AI explanatory text before/after code
+        # Look for the first real C/C++ code marker (usually #include or /*)
+        code_start_patterns = [r'^\s*#include', r'^\s*#define', r'^\s*/\*', r'^\s*//', r'^\s*typedef', r'^\s*struct', r'^\s*int\s+main', r'^\s*void\s+', r'^\s*float\s+']
+        
+        lines = code.split('\n')
+        start_idx = 0
+        end_idx = len(lines)
+        
+        # Find where actual code starts (skip AI explanations like "Here is...")
+        for i, line in enumerate(lines):
+            if any(re.match(pattern, line) for pattern in code_start_patterns):
+                start_idx = i
+                break
+        
+        # Find where actual code ends (before explanations like "This code does...")
+        # Heuristic: after the last closing brace at column 0, ignore remaining text
+        last_brace_idx = -1
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip() == '}' or lines[i].startswith('}'):
+                last_brace_idx = i
+                break
+        
+        if last_brace_idx > start_idx:
+            # Check if there's substantial text after the last brace
+            remaining_lines = lines[last_brace_idx + 1:]
+            non_empty = [l for l in remaining_lines if l.strip() and not l.strip().startswith('//')]
+            
+            # If there are more than 2 non-empty lines after last brace, likely explanatory text
+            if len(non_empty) > 2:
+                # Check if these lines look like natural language (contain common words)
+                explanation_keywords = ['this', 'the', 'code', 'implementation', 'performs', 'using', 'please', 'ensure', 'note']
+                if any(any(keyword in line.lower() for keyword in explanation_keywords) for line in non_empty[:3]):
+                    end_idx = last_brace_idx + 1
+                    print(f"Stripped explanatory text after code (removed {len(non_empty)} lines)")
+        
+        return '\n'.join(lines[start_idx:end_idx])
 
     def _get_mock_template(self, original_model_source: str, target: TargetType, iteration: int) -> str:
         if target == TargetType.OPENCL:
@@ -292,7 +460,7 @@ class Compiler:
         self.ndk_path = self._find_android_ndk()
     
     def _strip_markdown(self, code: str) -> str:
-        """Remove markdown code block markers from generated code"""
+        """Remove markdown code block markers and explanatory text from generated code"""
         import re
         
         # Remove opening code fence (```c, ```cpp, ```C, etc.)
@@ -311,14 +479,55 @@ class Compiler:
                 continue
             lines.append(line)
         
-        return '\n'.join(lines)
+        code = '\n'.join(lines)
+        
+        # CRITICAL: Remove AI explanatory text before/after code
+        # Look for the first real C/C++ code marker (usually #include or /*)
+        code_start_patterns = [r'^\s*#include', r'^\s*#define', r'^\s*/\*', r'^\s*//', r'^\s*typedef', r'^\s*struct', r'^\s*int\s+main', r'^\s*void\s+', r'^\s*float\s+']
+        
+        lines = code.split('\n')
+        start_idx = 0
+        end_idx = len(lines)
+        
+        # Find where actual code starts (skip AI explanations like "Here is...")
+        for i, line in enumerate(lines):
+            if any(re.match(pattern, line) for pattern in code_start_patterns):
+                start_idx = i
+                break
+        
+        # Find where actual code ends (before explanations like "This code does...")
+        # Heuristic: after the last closing brace at column 0, ignore remaining text
+        last_brace_idx = -1
+        for i in range(len(lines) - 1, -1, -1):
+            if lines[i].strip() == '}' or lines[i].startswith('}'):
+                last_brace_idx = i
+                break
+        
+        if last_brace_idx > start_idx:
+            # Check if there's substantial text after the last brace
+            remaining_lines = lines[last_brace_idx + 1:]
+            non_empty = [l for l in remaining_lines if l.strip() and not l.strip().startswith('//')]
+            
+            # If there are more than 2 non-empty lines after last brace, likely explanatory text
+            if len(non_empty) > 2:
+                # Check if these lines look like natural language (contain common words)
+                explanation_keywords = ['this', 'the', 'code', 'implementation', 'performs', 'using', 'please', 'ensure', 'note']
+                if any(any(keyword in line.lower() for keyword in explanation_keywords) for line in non_empty[:3]):
+                    end_idx = last_brace_idx + 1
+                    print(f"Stripped explanatory text after code (removed {len(non_empty)} lines)")
+        
+        return '\n'.join(lines[start_idx:end_idx])
     
-    def _sanitize_code(self, code: str) -> str:
+    def _sanitize_code(self, code: str, target: TargetType = None) -> str:
         """Remove problematic includes and C++ syntax that would prevent compilation"""
         import re
         
         # First strip markdown
         code = self._strip_markdown(code)
+        
+        # For OpenCL target, don't sanitize - allow OpenCL headers and C++ features
+        if target == TargetType.OPENCL:
+            return code
         
         original_code = code
         
@@ -381,7 +590,7 @@ class Compiler:
         return None
     
     def _get_android_clang(self, ndk_path, android_api="21", android_arch="aarch64"):
-        """Find Android clang compiler in NDK"""
+        """Find Android clang compiler in NDK (defaults to ARM64 for modern devices/GPUs)"""
         import platform
         
         # Detect host architecture
@@ -394,72 +603,124 @@ class Compiler:
             # Try x86_64 variant
             toolchain_dir = os.path.join(ndk_path, "toolchains/llvm/prebuilt", f"{system}-x86_64")
         
+        # Try specific architecture first (e.g., aarch64-linux-android21-clang)
         clang = os.path.join(toolchain_dir, "bin", f"{android_arch}-linux-android{android_api}-clang")
         if os.path.isfile(clang):
+            print(f"✓ Found ARM64 NDK compiler: {os.path.basename(clang)}")
             return clang
         
-        # Fallback to generic clang
+        # Try with higher API levels if specified one doesn't exist
+        for api in ["29", "28", "26", "24", "21", "19", "18"]:
+            clang = os.path.join(toolchain_dir, "bin", f"{android_arch}-linux-android{api}-clang")
+            if os.path.isfile(clang):
+                print(f"✓ Found ARM64 NDK compiler: {os.path.basename(clang)}")
+                return clang
+        
+        # Fallback to generic clang (will need -target flag)
         clang = os.path.join(toolchain_dir, "bin/clang")
         if os.path.isfile(clang):
+            print(f"⚠️  Using generic clang (will specify -target)")
             return clang
         
         return None
     
-    def compile(self, source_code: str, target: TargetType, compiler_cmd: str = "gcc", allow_mock: bool = True, toolchain_config: Optional[Any] = None) -> str:
+    def compile(self, source_code: str, target: TargetType, compiler_cmd: str = "gcc", toolchain_config: Optional[Any] = None, kernel_code: Optional[str] = None):
         """
         Compiles source code with toolchain support for cross-compilation.
+        Returns: (binary_path, kernel_path) tuple, or just binary_path for backward compatibility
         """
-        # SANITIZE the code before compilation to remove C++ features
-        source_code = self._sanitize_code(source_code)
+        # Determine file extension based on target
+        is_opencl = target == TargetType.OPENCL
         
-        # Save source to temp file (use .c for pure C code)
-        src_path = f"/tmp/source_{uuid.uuid4().hex}.c"
+        # SANITIZE the code before compilation to remove C++ features (but skip for OpenCL)
+        source_code = self._sanitize_code(source_code, target)
+        src_ext = ".cpp" if is_opencl else ".c"
+        
+        # Save source to temp file
+        src_path = f"/tmp/source_{uuid.uuid4().hex}{src_ext}"
         bin_path = f"/tmp/binary_{uuid.uuid4().hex}.bin"
+        kernel_path = None
         
         with open(src_path, "w") as f:
             f.write(source_code)
+        
+        # Write kernel code to .cl file if provided
+        if kernel_code and is_opencl:
+            kernel_path = f"/tmp/kernel_{uuid.uuid4().hex}.cl"
+            with open(kernel_path, "w") as f:
+                f.write(kernel_code)
+            print(f"Wrote OpenCL kernel to: {kernel_path}")
         
         compilation_errors = []
         
         # Try custom toolchain if provided
         if toolchain_config and compiler_cmd != "mock":
-            try:
-                cmd = [toolchain_config.compiler_path]
-                
-                # Add sysroot if specified
-                if toolchain_config.sysroot:
-                    cmd.extend(["--sysroot", toolchain_config.sysroot])
-                
-                # Add include paths
-                for include_path in toolchain_config.include_paths:
-                    cmd.extend(["-I", include_path])
-                
-                # Add library paths
-                for lib_path in toolchain_config.library_paths:
-                    cmd.extend(["-L", lib_path])
-                
-                # Add compiler flags
-                cmd.extend(toolchain_config.compiler_flags)
-                
-                # Add standard flags
-                cmd.extend(["-std=c11", "-o", bin_path, src_path])
-                
-                # Add linker flags
-                cmd.extend(toolchain_config.linker_flags)
-                
-                print(f"Compiling with toolchain: {' '.join(cmd)}")
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode == 0:
-                    print(f"Successfully compiled with custom toolchain: {bin_path}")
-                    return bin_path
-                else:
-                    error_msg = f"Custom toolchain compilation failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+            # For OpenCL: Ensure we're using a 64-bit ARM compiler (modern GPUs are 64-bit)
+            if is_opencl and "armv7" in toolchain_config.compiler_path.lower():
+                print(f"⚠️  Warning: Skipping 32-bit ARM compiler for OpenCL (GPUs require 64-bit)")
+                print(f"   Compiler: {toolchain_config.compiler_path}")
+                print(f"   Will try ARM64 NDK compiler instead...")
+                compilation_errors.append("32-bit ARM compiler not suitable for OpenCL - need ARM64")
+            else:
+                try:
+                    # Choose the right compiler: C++ for OpenCL, C for everything else
+                    compiler_path = toolchain_config.compiler_path
+                    if not is_opencl and compiler_path.endswith("clang++"):
+                        # For non-OpenCL C code, use clang instead of clang++
+                        compiler_path = compiler_path[:-2]  # Remove the "++"
+                        print(f"Switching to C compiler: {compiler_path}")
+                    
+                    cmd = [compiler_path]
+                    
+                    # Add sysroot if specified
+                    if toolchain_config.sysroot:
+                        cmd.extend(["--sysroot", toolchain_config.sysroot])
+                    
+                    # Add include paths
+                    for include_path in toolchain_config.include_paths:
+                        cmd.extend(["-I", include_path])
+                    
+                    # Add OpenCL include path if this is an OpenCL target
+                    if is_opencl:
+                        from backend.toolchain_discovery import ToolchainDiscovery
+                        discovery = ToolchainDiscovery()
+                        sdks = discovery.discover_gpu_sdks()
+                        opencl = sdks.get("opencl", {})
+                        if opencl.get("headers_path"):
+                            cmd.extend(["-I", opencl["headers_path"]])
+                    
+                    # Add library paths
+                    for lib_path in toolchain_config.library_paths:
+                        cmd.extend(["-L", lib_path])
+                    
+                    # Add compiler flags
+                    cmd.extend(toolchain_config.compiler_flags)
+                    
+                    # Add standard flags (C++ for OpenCL, C for others)
+                    std_flag = "-std=c++14" if is_opencl else "-std=c11"
+                    cmd.extend([std_flag, "-o", bin_path, src_path])
+                    
+                    # Add linker flags
+                    cmd.extend(toolchain_config.linker_flags)
+                    
+                    # For OpenCL: Static linking and undefined symbols
+                    if is_opencl:
+                        cmd.extend(["-static-libstdc++", "-static-libgcc"])
+                        cmd.extend(["-Wl,--allow-shlib-undefined", "-Wl,--unresolved-symbols=ignore-all"])
+                    
+                    print(f"Compiling with toolchain: {' '.join(cmd)}")
+                    result = subprocess.run(cmd, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        print(f"Successfully compiled with custom toolchain: {bin_path}")
+                        return (bin_path, kernel_path) if kernel_path else bin_path
+                    else:
+                        error_msg = f"Custom toolchain compilation failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+                        print(error_msg)
+                        compilation_errors.append(error_msg)
+                except Exception as e:
+                    error_msg = f"Custom toolchain error: {e}"
                     print(error_msg)
                     compilation_errors.append(error_msg)
-            except Exception as e:
-                error_msg = f"Custom toolchain error: {e}"
-                print(error_msg)
-                compilation_errors.append(error_msg)
         
         # Try Android NDK cross-compilation if available
         if self.ndk_path and compiler_cmd != "mock":
@@ -467,20 +728,52 @@ class Compiler:
             if android_clang:
                 try:
                     print(f"Using Android NDK clang: {android_clang}")
-                    cmd = [
-                        android_clang,
-                        "-target", "aarch64-linux-android21",
-                        "-std=c11",  # Use C11 instead of C++
-                        "-static",  # Statically link everything - no runtime dependencies
-                        "-o", bin_path,
-                        src_path
-                    ]
+                    cmd = [android_clang, "-target", "aarch64-linux-android21"]
+                    
+                    # Source file must come before output for proper linking
+                    cmd.append(src_path)
+                    
+                    # OpenCL-specific compilation
+                    if is_opencl:
+                        cmd.extend(["-std=c++14"])  # Use C++ for OpenCL
+                        
+                        # Add OpenCL include paths
+                        from backend.toolchain_discovery import ToolchainDiscovery
+                        discovery = ToolchainDiscovery()
+                        sdks = discovery.discover_gpu_sdks()
+                        opencl = sdks.get("opencl", {})
+                        if opencl.get("headers_path"):
+                            cmd.extend(["-I", opencl["headers_path"]])
+                            print(f"Using OpenCL headers from: {opencl['headers_path']}")
+                        
+                        # Statically link C++ runtime so we don't need libc++_shared.so on device
+                        cmd.extend(["-static-libstdc++", "-static-libgcc"])
+                        print("Note: Statically linking C++ runtime for self-contained binary")
+                        
+                        # CRITICAL: Don't link OpenCL library at compile time!
+                        # Allow undefined symbols - they'll be resolved at runtime on device
+                        # The device has /system/lib64/libOpenCL.so which will be dynamically linked
+                        cmd.extend(["-Wl,--allow-shlib-undefined", "-Wl,--unresolved-symbols=ignore-all"])
+                        print("Note: OpenCL symbols will be resolved at runtime by device's dynamic linker")
+                    else:
+                        cmd.extend(["-std=c11"])  # Use C11 for non-OpenCL
+                        cmd.extend(["-static"])  # Statically link for non-OpenCL
+                    
+                    cmd.extend(["-o", bin_path])
+                    
+                    print(f"Compiling with NDK: {' '.join(cmd)}")
                     result = subprocess.run(cmd, capture_output=True, text=True)
                     if result.returncode == 0:
                         print(f"Successfully cross-compiled for Android: {bin_path}")
-                        return bin_path
+                        # Verify binary was created
+                        if os.path.exists(bin_path) and os.path.getsize(bin_path) > 0:
+                            return (bin_path, kernel_path) if kernel_path else bin_path
+                        else:
+                            error_msg = "Binary file was not created or is empty"
+                            print(error_msg)
+                            compilation_errors.append(error_msg)
                     else:
-                        error_msg = f"Android NDK compilation failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+                        error_msg = f"Android NDK compilation failed:\nCommand: {' '.join(cmd)}\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
                         print(error_msg)
                         compilation_errors.append(error_msg)
                 except FileNotFoundError as e:
@@ -491,11 +784,34 @@ class Compiler:
         # Try regular compilation if not mock mode
         if compiler_cmd != "mock":
             try:
-                # Use gcc for C files (don't use -static on macOS as it causes linker issues)
-                cmd = [compiler_cmd, "-std=c11", "-o", bin_path, src_path]
+                # Determine compiler and flags based on target
+                if is_opencl:
+                    # Use g++ for OpenCL C++ code
+                    cpp_compiler = "g++" if compiler_cmd == "gcc" else compiler_cmd
+                    cmd = [cpp_compiler, "-std=c++14", "-o", bin_path, src_path]
+                    
+                    # Add OpenCL include and library paths
+                    from backend.toolchain_discovery import ToolchainDiscovery
+                    discovery = ToolchainDiscovery()
+                    sdks = discovery.discover_gpu_sdks()
+                    opencl = sdks.get("opencl", {})
+                    
+                    if opencl.get("headers_path"):
+                        cmd.extend(["-I", opencl["headers_path"]])
+                    
+                    # Platform-specific OpenCL linking
+                    import platform
+                    if platform.system() == "Darwin":
+                        cmd.extend(["-framework", "OpenCL"])
+                    else:
+                        cmd.append("-lOpenCL")
+                else:
+                    # Use gcc for C files (don't use -static on macOS as it causes linker issues)
+                    cmd = [compiler_cmd, "-std=c11", "-o", bin_path, src_path]
+                
                 result = subprocess.run(cmd, capture_output=True, text=True)
                 if result.returncode == 0:
-                    return bin_path
+                    return (bin_path, kernel_path) if kernel_path else bin_path
                 else:
                     error_msg = f"Compilation with {compiler_cmd} failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
                     print(error_msg)
@@ -505,39 +821,40 @@ class Compiler:
                 print(error_msg)
                 compilation_errors.append(error_msg)
         
-        # If mock is not allowed (e.g., when using ADB), raise an error
-        if not allow_mock:
-            all_errors = "\n\n".join(compilation_errors)
-            raise Exception(f"Compilation failed and mock mode is not allowed:\n{all_errors}")
-        
-        # Mock binary (source code as placeholder) - only for mock mode
-        with open(bin_path, "w") as f:
-            f.write(source_code)
-        return bin_path
+        # ALWAYS raise error if compilation fails - NO MOCK MODE EVER
+        all_errors = "\n\n".join(compilation_errors)
+        error_summary = f"❌ ALL COMPILATION ATTEMPTS FAILED ({len(compilation_errors)} attempts)"
+        raise Exception(f"{error_summary}\n\n{all_errors}")
 
 class DeviceRunner:
-    def deploy_and_run(self, binary_path: str, input_data: np.ndarray, config: DeviceConfig, expected_output: Optional[np.ndarray] = None, logs: List[Dict[str, Any]] = None) -> np.ndarray:
+    def deploy_and_run(self, binary_path, input_data: np.ndarray, config: DeviceConfig, expected_output: Optional[np.ndarray] = None, logs: List[Dict[str, Any]] = None) -> np.ndarray:
         """
-        Deploy and run on device. Supports SSH, ADB, Local, or Mock.
+        Deploy and run on device. Supports SSH, ADB, or Local execution ONLY.
+        NO MOCK MODE - Real execution required at all times.
+        binary_path can be a string or a tuple (binary_path, kernel_path)
         """
+        # Handle tuple return from compiler (for OpenCL)
+        kernel_path = None
+        if isinstance(binary_path, tuple):
+            binary_path, kernel_path = binary_path
+        
         # Check connection type
         if hasattr(config, 'connection_type'):
             if config.connection_type == 'ssh':
-                return self._run_ssh(binary_path, input_data, config, expected_output, logs=logs)
+                return self._run_ssh(binary_path, input_data, config, expected_output, logs=logs, kernel_path=kernel_path)
             elif config.connection_type == 'adb':
-                return self._run_adb(binary_path, input_data, config, expected_output, logs=logs)
+                return self._run_adb(binary_path, input_data, config, expected_output, logs=logs, kernel_path=kernel_path)
+            elif config.connection_type == 'local':
+                return self._run_local(binary_path, input_data, expected_output, logs=logs, kernel_path=kernel_path)
         
         # Legacy support
         if config.use_adb:
-            return self._run_adb(binary_path, input_data, config, expected_output, logs=logs)
-        
-        if config.mock:
-            return self._run_mock(binary_path, input_data, expected_output)
+            return self._run_adb(binary_path, input_data, config, expected_output, logs=logs, kernel_path=kernel_path)
         
         # Default to local execution
-        return self._run_local(binary_path, input_data, expected_output, logs=logs)
+        return self._run_local(binary_path, input_data, expected_output, logs=logs, kernel_path=kernel_path)
 
-    def _run_local(self, binary_path: str, input_data: np.ndarray, expected_output: Optional[np.ndarray] = None, logs: List[Dict[str, Any]] = None) -> np.ndarray:
+    def _run_local(self, binary_path: str, input_data: np.ndarray, expected_output: Optional[np.ndarray] = None, logs: List[Dict[str, Any]] = None, kernel_path: Optional[str] = None) -> np.ndarray:
         """
         Run binary locally on host machine (macOS/Linux).
         """
@@ -554,9 +871,16 @@ class DeviceRunner:
             binary_dir = "/tmp"
         local_input = os.path.join(binary_dir, "input.bin")
         local_output = os.path.join(binary_dir, "output.bin")
+        local_kernel = os.path.join(binary_dir, "kernel.cl")
         
         # Copy input file
         shutil.copy(input_file, local_input)
+        
+        # Copy kernel file if provided (for OpenCL)
+        if kernel_path and os.path.exists(kernel_path):
+            shutil.copy(kernel_path, local_kernel)
+            if logs is not None:
+                logs.append({"stage": "Local Setup", "status": "Success", "details": f"Copied kernel.cl to {local_kernel}"})
         
         try:
             if logs is not None:
@@ -566,18 +890,34 @@ class DeviceRunner:
             os.chmod(binary_path, 0o755)
             
             # Execute binary locally
+            import time
+            start_time = time.time()
             result = subprocess.run([binary_path], capture_output=True, text=True, timeout=30, cwd=binary_dir)
+            execution_time = time.time() - start_time
             
             if logs is not None:
-                stdout_preview = result.stdout[:200] if result.stdout else "No output"
-                logs.append({"stage": "Local Execute", "status": "Success" if result.returncode == 0 else "Failed", 
-                           "details": f"Exit code: {result.returncode}\nOutput: {stdout_preview}"})
-            
-            if result.returncode != 0:
-                error_msg = f"Binary execution failed with exit code {result.returncode}\nSTDERR: {result.stderr}"
-                if logs is not None:
+                if result.returncode == 0:
+                    logs.append({"stage": "Local Execute", "status": "Success", "details": f"Execution complete in {execution_time:.3f}s"})
+                    
+                    # Add detailed output
+                    if result.stdout or result.stderr:
+                        device_output = ""
+                        if result.stdout:
+                            device_output += f"STDOUT:\n{result.stdout}"
+                        if result.stderr:
+                            device_output += f"\n\nSTDERR:\n{result.stderr}" if result.stdout else f"STDERR:\n{result.stderr}"
+                        
+                        logs.append({
+                            "stage": "Device Output",
+                            "status": "Info",
+                            "details": device_output,
+                            "execution_time": f"{execution_time:.3f}s"
+                        })
+                        print(f"\n{'='*60}\nLOCAL EXECUTION OUTPUT:\n{'='*60}\n{device_output}\n{'='*60}\n")
+                else:
+                    error_msg = f"Binary execution failed with exit code {result.returncode} (took {execution_time:.3f}s)\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}"
                     logs.append({"stage": "Local Execute", "status": "Failed", "details": error_msg})
-                raise RuntimeError(error_msg)
+                    raise RuntimeError(error_msg)
             
             # Read output file
             if os.path.exists(local_output) and os.path.getsize(local_output) > 0:
@@ -617,6 +957,8 @@ class DeviceRunner:
                 os.remove(local_input)
             if os.path.exists(local_output):
                 os.remove(local_output)
+            if kernel_path and os.path.exists(local_kernel):
+                os.remove(local_kernel)
     
     def _run_mock(self, binary_path: str, input_data: np.ndarray, expected_output: Optional[np.ndarray] = None) -> np.ndarray:
         time.sleep(1) # Simulate
@@ -649,7 +991,7 @@ class DeviceRunner:
         
         return ref_vals * 0.8
 
-    def _run_ssh(self, binary_path: str, input_data: np.ndarray, config: DeviceConfig, expected_output: Optional[np.ndarray] = None, logs: List[Dict[str, Any]] = None) -> np.ndarray:
+    def _run_ssh(self, binary_path: str, input_data: np.ndarray, config: DeviceConfig, expected_output: Optional[np.ndarray] = None, logs: List[Dict[str, Any]] = None, kernel_path: Optional[str] = None) -> np.ndarray:
         """
         Deploy and run binary on remote device via SSH.
         """
@@ -723,17 +1065,36 @@ class DeviceRunner:
             if logs is not None:
                 logs.append({"stage": "SSH Execute", "status": "Running", "details": f"Executing {os.path.basename(binary_path)}..."})
             
+            import time
+            start_time = time.time()
             stdin, stdout, stderr = ssh.exec_command(f"cd {config.remote_work_dir} && ./{os.path.basename(binary_path)}")
             exit_code = stdout.channel.recv_exit_status()
+            execution_time = time.time() - start_time
             
             stdout_text = stdout.read().decode('utf-8')
             stderr_text = stderr.read().decode('utf-8')
             
             if exit_code == 0:
                 if logs is not None:
-                    logs.append({"stage": "SSH Execute", "status": "Success", "details": f"Execution complete\nOutput: {stdout_text[:200]}"})
+                    logs.append({"stage": "SSH Execute", "status": "Success", "details": f"Execution complete in {execution_time:.3f}s"})
+                    
+                    # Add detailed device output
+                    if stdout_text or stderr_text:
+                        device_output = ""
+                        if stdout_text:
+                            device_output += f"STDOUT:\n{stdout_text}"
+                        if stderr_text:
+                            device_output += f"\n\nSTDERR:\n{stderr_text}" if stdout_text else f"STDERR:\n{stderr_text}"
+                        
+                        logs.append({
+                            "stage": "Device Output",
+                            "status": "Info",
+                            "details": device_output,
+                            "execution_time": f"{execution_time:.3f}s"
+                        })
+                        print(f"\n{'='*60}\nDEVICE EXECUTION OUTPUT (SSH):\n{'='*60}\n{device_output}\n{'='*60}\n")
             else:
-                error_msg = f"Execution failed with exit code {exit_code}\nSTDERR: {stderr_text}"
+                error_msg = f"Execution failed with exit code {exit_code} (took {execution_time:.3f}s)\nSTDOUT: {stdout_text}\nSTDERR: {stderr_text}"
                 if logs is not None:
                     logs.append({"stage": "SSH Execute", "status": "Failed", "details": error_msg})
                 raise RuntimeError(error_msg)
@@ -776,11 +1137,8 @@ class DeviceRunner:
             error_msg = f"SSH deployment failed: {str(e)}"
             if logs is not None:
                 logs.append({"stage": "SSH Error", "status": "Failed", "details": error_msg})
-            # Return mock output on error
-            if expected_output is not None:
-                return expected_output * 0.8
-            else:
-                return input_data * 0.8
+            # Re-raise so AI can fix the error
+            raise
         finally:
             try:
                 sftp.close()
@@ -788,15 +1146,19 @@ class DeviceRunner:
             except:
                 pass
 
-    def _run_adb(self, binary_path: str, input_data: np.ndarray, config: DeviceConfig, expected_output: Optional[np.ndarray] = None, logs: List[Dict[str, Any]] = None) -> np.ndarray:
+    def _run_adb(self, binary_path: str, input_data: np.ndarray, config: DeviceConfig, expected_output: Optional[np.ndarray] = None, logs: List[Dict[str, Any]] = None, kernel_path: Optional[str] = None) -> np.ndarray:
         """
         Deploy and run binary on Android device via ADB.
         Returns output from device execution.
         """
         import subprocess
+        from backend.toolchain_discovery import ADBDiscovery
         
-        # Use configured ADB path or default
-        ADB_PATH = config.adb_path if hasattr(config, 'adb_path') and config.adb_path else os.path.expanduser("~/Library/Android/sdk/platform-tools/adb")
+        # ALWAYS use ADBDiscovery to find ADB (consistent with compilation phase)
+        ADB_PATH = config.adb_path if (hasattr(config, 'adb_path') and config.adb_path) else ADBDiscovery.find_adb()
+        
+        if not ADB_PATH:
+            raise Exception("❌ ADB not found on system.\n\nPlease:\n1. Install Android SDK Platform Tools\n2. Restart the server\n3. Or manually set ADB path in Connection Settings")
         
         if logs is None:
             logs = []
@@ -810,7 +1172,14 @@ class DeviceRunner:
             
             # Parse devices output
             lines = result.stdout.strip().split('\n')[1:]  # Skip "List of devices attached"
-            devices = [line.split()[0] for line in lines if line.strip() and '\tdevice' in line]
+            devices = []
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] == 'device':
+                    devices.append(parts[0])
             
             if not devices:
                 raise Exception("❌ No Android devices connected via ADB.\n\nPlease:\n1. Connect an Android device via USB\n2. Enable USB debugging on the device\n3. Run 'adb devices' to verify connection\n\nOr select 'Local' connection type to test on host machine instead.")
@@ -829,6 +1198,7 @@ class DeviceRunner:
         remote_bin = f"{config.remote_work_dir}/{os.path.basename(binary_path)}"
         remote_input = f"{config.remote_work_dir}/input.bin"
         remote_out = f"{config.remote_work_dir}/output.bin"
+        remote_kernel = f"{config.remote_work_dir}/kernel.cl"
         
         adb_cmd = [ADB_PATH]
         if config.adb_device_id:
@@ -845,6 +1215,16 @@ class DeviceRunner:
             if logs is not None:
                 logs.append({"stage": "ADB Push", "status": "Success", "details": f"Copied to {remote_bin}"})
             
+            # Step 1.5: Diagnostic - check binary dependencies (for OpenCL debugging)
+            if kernel_path:  # Only for OpenCL targets
+                try:
+                    diag_cmd = adb_cmd + ["shell", f"readelf -d {remote_bin} | grep NEEDED || file {remote_bin}"]
+                    diag_result = subprocess.run(diag_cmd, capture_output=True, text=True, timeout=10)
+                    if diag_result.stdout.strip():
+                        print(f"📋 Binary dependencies:\n{diag_result.stdout.strip()}")
+                except:
+                    pass  # Diagnostic failure is non-fatal
+            
             # Step 2: Push input data to device
             if logs is not None:
                 logs.append({"stage": "ADB Push Input", "status": "Running", "details": f"Copying input data ({input_data.size} values) to device..."})
@@ -854,6 +1234,56 @@ class DeviceRunner:
             
             if logs is not None:
                 logs.append({"stage": "ADB Push Input", "status": "Success", "details": f"Input data copied to {remote_input}"})
+            
+            # Step 2.5: Push kernel file if provided (for OpenCL)
+            if kernel_path and os.path.exists(kernel_path):
+                if logs is not None:
+                    logs.append({"stage": "ADB Push Kernel", "status": "Running", "details": f"Copying kernel.cl to device..."})
+                
+                push_kernel_cmd = adb_cmd + ["push", kernel_path, remote_kernel]
+                subprocess.run(push_kernel_cmd, capture_output=True, text=True, check=True)
+                
+                if logs is not None:
+                    logs.append({"stage": "ADB Push Kernel", "status": "Success", "details": f"Kernel copied to {remote_kernel}"})
+            
+            # Step 2.6: Push OpenCL library if we have one (for OpenCL targets)
+            # This is crucial because SELinux may prevent access to /vendor/lib64
+            opencl_lib_pushed = False
+            if kernel_path:  # Only for OpenCL targets
+                # Get device ID - use configured one or detect from connected devices
+                device_id = config.adb_device_id
+                if not device_id and devices:
+                    device_id = devices[0]  # Use first connected device
+                    print(f"Using detected device ID: {device_id}")
+                
+                if device_id:
+                    # Try to find the pulled OpenCL library for this device
+                    device_lib_dir = os.path.join(os.path.dirname(__file__), "opencl_sdk", "libs", device_id)
+                    local_opencl_lib = os.path.join(device_lib_dir, "libOpenCL.so")
+                else:
+                    local_opencl_lib = None
+                    print("⚠️  No device ID found, will try system OpenCL paths")
+                
+                if local_opencl_lib and os.path.exists(local_opencl_lib):
+                    if logs is not None:
+                        logs.append({"stage": "ADB Push OpenCL", "status": "Running", "details": f"Copying libOpenCL.so to device..."})
+                    
+                    remote_opencl_lib = f"{config.remote_work_dir}/libOpenCL.so"
+                    push_opencl_cmd = adb_cmd + ["push", local_opencl_lib, remote_opencl_lib]
+                    result = subprocess.run(push_opencl_cmd, capture_output=True, text=True)
+                    
+                    if result.returncode == 0:
+                        opencl_lib_pushed = True
+                        if logs is not None:
+                            logs.append({"stage": "ADB Push OpenCL", "status": "Success", "details": f"OpenCL library copied to {remote_opencl_lib}"})
+                        print(f"✓ Pushed OpenCL library to device for local linking")
+                        
+                        # Verify the library on device
+                        verify_cmd = adb_cmd + ["shell", f"file {remote_opencl_lib} || ls -lh {remote_opencl_lib}"]
+                        verify_result = subprocess.run(verify_cmd, capture_output=True, text=True)
+                        print(f"Library verification: {verify_result.stdout.strip()}")
+                    else:
+                        print(f"⚠️  Failed to push OpenCL library: {result.stderr}")
             
             # Step 3: Set executable permissions
             if logs is not None:
@@ -865,16 +1295,122 @@ class DeviceRunner:
             if logs is not None:
                 logs.append({"stage": "ADB Chmod", "status": "Success", "details": "Permissions set"})
             
-            # Step 4: Execute binary on device
+            # Step 3.5: Create and push a wrapper script that sets LD_LIBRARY_PATH
+            # CRITICAL: Use system paths FIRST (SELinux often blocks loading from /data/local/tmp)
+            # The copied library is just a backup for analysis
+            lib_path_value = "/vendor/lib64:/system/lib64:/vendor/lib:/system/lib"
+            if opencl_lib_pushed:
+                # Add local path as LAST resort (often blocked by SELinux)
+                lib_path_value += f":{config.remote_work_dir}"
+                print(f"Using system OpenCL libraries (with local backup at {config.remote_work_dir})")
+            else:
+                print("Using system OpenCL library paths only")
+            
+            wrapper_script = f"""#!/system/bin/sh
+cd {config.remote_work_dir}
+export LD_LIBRARY_PATH={lib_path_value}
+
+# AGGRESSIVE DIAGNOSTICS
+echo "╔═══════════════════════════════════════╗"
+echo "║  OpenCL Runtime Diagnostics           ║"
+echo "╚═══════════════════════════════════════╝"
+echo ""
+echo "1. LD_LIBRARY_PATH:"
+echo "   $LD_LIBRARY_PATH"
+echo ""
+echo "2. OpenCL library search:"
+for lib_path in /vendor/lib64 /system/lib64 /vendor/lib /system/lib {config.remote_work_dir}; do
+    if [ -f "$lib_path/libOpenCL.so" ]; then
+        echo "   ✓ Found: $lib_path/libOpenCL.so"
+        ls -lh "$lib_path/libOpenCL.so"
+        file "$lib_path/libOpenCL.so" 2>&1 | head -1
+    fi
+done
+echo ""
+echo "3. Binary info:"
+file ./{os.path.basename(binary_path)}
+echo ""
+echo "4. Binary dependencies:"
+readelf -d ./{os.path.basename(binary_path)} | grep NEEDED || echo "   (no deps found)"
+echo ""
+echo "5. Executing with OpenCL..."
+echo "═══════════════════════════════════════"
+echo ""
+
+# Use LD_PRELOAD by default (most reliable for OpenCL on Android)
+if [ -f "/vendor/lib64/libOpenCL.so" ]; then
+    export LD_PRELOAD="/vendor/lib64/libOpenCL.so"
+    echo "✓ Using LD_PRELOAD=/vendor/lib64/libOpenCL.so"
+elif [ -f "/system/lib64/libOpenCL.so" ]; then
+    export LD_PRELOAD="/system/lib64/libOpenCL.so"
+    echo "✓ Using LD_PRELOAD=/system/lib64/libOpenCL.so"
+elif [ -f "{config.remote_work_dir}/libOpenCL.so" ]; then
+    export LD_PRELOAD="{config.remote_work_dir}/libOpenCL.so"
+    echo "✓ Using LD_PRELOAD={config.remote_work_dir}/libOpenCL.so"
+fi
+
+echo ""
+./{os.path.basename(binary_path)}
+EXIT_CODE=$?
+
+echo ""
+echo "═══════════════════════════════════════"
+echo "Final exit code: $EXIT_CODE"
+exit $EXIT_CODE
+"""
+            local_wrapper = f"/tmp/run_wrapper_{uuid.uuid4().hex}.sh"
+            remote_wrapper = f"{config.remote_work_dir}/run_wrapper.sh"
+            
+            with open(local_wrapper, "w") as f:
+                f.write(wrapper_script)
+            
+            # Push wrapper script
+            push_wrapper_cmd = adb_cmd + ["push", local_wrapper, remote_wrapper]
+            subprocess.run(push_wrapper_cmd, capture_output=True, text=True, check=True)
+            
+            # Make wrapper executable
+            chmod_wrapper_cmd = adb_cmd + ["shell", "chmod", "+x", remote_wrapper]
+            subprocess.run(chmod_wrapper_cmd, capture_output=True, text=True, check=True)
+            
+            # Clean up local wrapper
+            try:
+                os.remove(local_wrapper)
+            except:
+                pass
+            
+            # Step 4: Execute binary on device via wrapper script
             if logs is not None:
                 logs.append({"stage": "ADB Execute", "status": "Running", "details": f"Running {os.path.basename(binary_path)} on device..."})
             
-            exec_cmd = adb_cmd + ["shell", f"cd {config.remote_work_dir} && ./{os.path.basename(binary_path)}"]
+            import time
+            start_time = time.time()
+            exec_cmd = adb_cmd + ["shell", remote_wrapper]
             exec_result = subprocess.run(exec_cmd, capture_output=True, text=True, check=True)
+            execution_time = time.time() - start_time
+            
+            # Capture full device output for detailed logging
+            device_stdout = exec_result.stdout if exec_result.stdout else ""
+            device_stderr = exec_result.stderr if exec_result.stderr else ""
             
             if logs is not None:
-                stdout_preview = exec_result.stdout[:200] if exec_result.stdout else "No output"
-                logs.append({"stage": "ADB Execute", "status": "Success", "details": f"Execution complete\nOutput: {stdout_preview}"})
+                # Add execution summary
+                logs.append({"stage": "ADB Execute", "status": "Success", "details": f"Execution complete in {execution_time:.3f}s"})
+                
+                # Add detailed device output as a separate log entry
+                if device_stdout or device_stderr:
+                    device_output = ""
+                    if device_stdout:
+                        device_output += f"STDOUT:\n{device_stdout}"
+                    if device_stderr:
+                        device_output += f"\n\nSTDERR:\n{device_stderr}" if device_stdout else f"STDERR:\n{device_stderr}"
+                    
+                    logs.append({
+                        "stage": "Device Output", 
+                        "status": "Info", 
+                        "details": device_output,
+                        "execution_time": f"{execution_time:.3f}s"
+                    })
+                    print(f"\n{'='*60}\nDEVICE EXECUTION OUTPUT:\n{'='*60}\n{device_output}\n{'='*60}\n")
             
             # Step 5: Pull output file from device
             if logs is not None:
@@ -935,36 +1471,23 @@ class DeviceRunner:
                 if logs is not None:
                     logs.append({"stage": "ADB Pull", "status": "Warning", "details": "No output file found on device"})
             
-            # Fallback: Return mock data if parsing failed
-            if logs is not None:
-                logs.append({"stage": "Note", "status": "Warning", "details": "Falling back to mock output due to parsing failure"})
-            
-            # Generate mock output based on expected output or input shape
-            if expected_output is not None:
-                return expected_output * 0.8  # Mock return close to expected
-            else:
-                return input_data * 0.8  # Mock return based on input
+            # If we reached here, output parsing failed - raise exception for AI to fix
+            raise FileNotFoundError("Binary executed but produced no valid output file. The code may have crashed or failed to write output.bin.")
             
         except subprocess.CalledProcessError as e:
             error_msg = f"ADB command failed: {e.stderr if e.stderr else str(e)}"
             if logs is not None:
                 logs.append({"stage": "ADB Error", "status": "Failed", "details": error_msg})
             print(f"ADB Error: {error_msg}")
-            # Return mock output on error
-            if expected_output is not None:
-                return expected_output * 0.8
-            else:
-                return input_data * 0.8
+            # Re-raise so AI can fix the execution error
+            raise RuntimeError(error_msg)
         except Exception as e:
             error_msg = f"Unexpected error: {str(e)}"
             if logs is not None:
                 logs.append({"stage": "ADB Error", "status": "Failed", "details": error_msg})
             print(f"ADB Error: {error_msg}")
-            # Return mock output on error
-            if expected_output is not None:
-                return expected_output * 0.8
-            else:
-                return input_data * 0.8
+            # Re-raise so AI can fix the error
+            raise
 
 class PortingEngine:
     def __init__(self):
@@ -1040,17 +1563,30 @@ class PortingEngine:
             # We pass the FILE CONTENT as source logic
             with open(source_model_path, 'r') as f:
                 src_content = f.read()
-            generated_code = self.generator.generate(src_content, target, i, debug_instructions=debug_instructions, device_config=config)
-            add_log({"stage": f"Iteration {i}", "status": "Code Generated", "source_preview": generated_code})
+            code_result = self.generator.generate(src_content, target, i, debug_instructions=debug_instructions, device_config=config)
+            
+            # Handle dict return from generator
+            if isinstance(code_result, dict):
+                host_code = code_result.get("host_code", "")
+                kernel_code = code_result.get("kernel_code")
+            else:
+                # Backward compatibility
+                host_code = code_result
+                kernel_code = None
+            
+            add_log({"stage": f"Iteration {i}", "status": "Code Generated", "source_preview": host_code[:500]})
             
             # Save generated code
-            save_artifact(f"generated_code_iter_{i}.c", generated_code)
+            file_ext = ".cpp" if target == TargetType.OPENCL else ".c"
+            save_artifact(f"generated_code_iter_{i}{file_ext}", host_code)
+            if kernel_code:
+                save_artifact(f"kernel_iter_{i}.cl", kernel_code)
             
             # Compile
             add_log({"stage": f"Iteration {i}", "status": "Compiling", "details": f"Target: {target.value}"})
             try:
                 toolchain = config.toolchain if hasattr(config, 'toolchain') else None
-                binary = self.compiler.compile(generated_code, target, config.compiler_cmd, allow_mock=not config.use_adb, toolchain_config=toolchain)
+                binary = self.compiler.compile(host_code, target, config.compiler_cmd, toolchain_config=toolchain, kernel_code=kernel_code)
             except Exception as e:
                 add_log({"stage": f"Iteration {i}", "status": "Compilation Failed", "details": str(e)})
                 continue
@@ -1133,12 +1669,41 @@ class PortingEngine:
         
         add_log({"stage": "Initialization", "status": "Starting Manual Verification", "details": f"Auto-fix enabled: {max_iterations} iterations max, Target: {target.value}"})
         
-        # 1. Load initial source code
+        # 1. Load initial source code and check if it's part of a project
         add_log({"stage": "Source Code", "status": "Loading", "details": f"Reading manual source code..."})
+        project_context = None
         try:
             with open(manual_source_path, 'r') as f:
                 src_content = f.read()
-            add_log({"stage": "Source Code", "status": "Loaded", "source_preview": src_content[:500] + "..." if len(src_content) > 500 else src_content})
+            
+            # Check if this file is part of a project (has .project_manifest.json in parent dir)
+            source_dir = os.path.dirname(manual_source_path)
+            manifest_path = os.path.join(source_dir, ".project_manifest.json")
+            
+            if os.path.exists(manifest_path):
+                # Load project context
+                with open(manifest_path, 'r') as f:
+                    manifest = json.load(f)
+                
+                project_files = {}
+                for rel_path in manifest.get("files", []):
+                    full_path = os.path.join(os.path.dirname(source_dir), rel_path)
+                    if os.path.exists(full_path):
+                        try:
+                            with open(full_path, 'r') as pf:
+                                project_files[rel_path] = pf.read()
+                        except:
+                            pass  # Skip binary or unreadable files
+                
+                project_context = {
+                    "folder_name": manifest.get("folder_name", "project"),
+                    "files": project_files,
+                    "main_file": manifest.get("main_file", "")
+                }
+                
+                add_log({"stage": "Source Code", "status": "Loaded", "details": f"📁 Project with {len(project_files)} files", "source_preview": src_content[:500] + "..." if len(src_content) > 500 else src_content})
+            else:
+                add_log({"stage": "Source Code", "status": "Loaded", "source_preview": src_content[:500] + "..." if len(src_content) > 500 else src_content})
         except Exception as e:
             add_log({"stage": "Source Code", "status": "Failed", "details": str(e)})
             return logs
@@ -1166,18 +1731,33 @@ class PortingEngine:
                 add_log({"stage": "Reference Model (HOST)", "status": "Failed", "details": f"Could not load reference: {str(e)}"})
                 ref_output = None
         
-        # 3. Iterative compile-test-fix loop
+        # 3. Iterative compile-test-fix loop with smart error tracking
         best_diff = float('inf')
         current_code = src_content
+        current_kernel = None  # For OpenCL targets
+        error_history = []  # Track errors to detect infinite loops
         
         for iteration in range(max_iterations):
+            # Check if we're stuck in a loop (same error 3+ times)
+            if len(error_history) >= 3:
+                last_three = error_history[-3:]
+                if all(e == last_three[0] for e in last_three):
+                    add_log({"stage": "Result", "status": "Failed", "details": f"⚠️ STUCK IN LOOP: Same error repeated 3 times.\n\nError: {last_three[0]}\n\nThis is likely a system/infrastructure issue, not a code issue. The AI cannot fix this.\n\nSuggestions:\n1. Check if libOpenCL.so is correct architecture (32-bit vs 64-bit)\n2. Try running locally first (connection_type: local)\n3. Manually verify OpenCL works on device: adb shell 'ls -la /vendor/lib64/libOpenCL.so'\n4. Check SELinux policies"})
+                    return logs
             add_log({"stage": f"Iteration {iteration}", "status": "Starting", "details": f"Testing code version {iteration}"})
+            
+            # Handle dict format (from AI fixes for OpenCL)
+            if isinstance(current_code, dict):
+                host_code = current_code.get("host_code", "")
+                current_kernel = current_code.get("kernel_code")
+            else:
+                host_code = current_code
             
             # Compile
             add_log({"stage": f"Iteration {iteration}", "status": "Compiling", "details": f"Target: {target.value}"})
             try:
                 toolchain = config.toolchain if hasattr(config, 'toolchain') else None
-                binary = self.compiler.compile(current_code, target, config.compiler_cmd, allow_mock=not config.use_adb, toolchain_config=toolchain)
+                binary = self.compiler.compile(host_code, target, config.compiler_cmd, toolchain_config=toolchain, kernel_code=current_kernel)
                 add_log({"stage": f"Iteration {iteration}", "status": "Compilation Success", "details": f"Binary: {binary}"})
             except Exception as e:
                 compilation_error = str(e)
@@ -1192,8 +1772,7 @@ class PortingEngine:
                             ref_content = f.read()
                         
                         error_feedback = f"COMPILATION ERROR:\n{compilation_error}\n\nFix the C code to compile successfully."
-                        fixed_code = self.generator.generate(ref_content, target, iteration, error_feedback=error_feedback, debug_instructions=debug_instructions, device_config=config)
-                        current_code = fixed_code
+                        current_code = self.generator.generate(ref_content, target, iteration, error_feedback=error_feedback, debug_instructions=debug_instructions, device_config=config, project_context=project_context)
                         add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code version"})
                         continue
                     except Exception as fix_error:
@@ -1202,98 +1781,117 @@ class PortingEngine:
                 else:
                     continue
             
-            # Run on TARGET
-            if config.connection_type == "adb" or config.use_adb:
-                add_log({"stage": f"Iteration {iteration} (TARGET)", "status": "Deploying", "details": f"Pushing to device..."})
-                try:
-                    actual_output = self.runner.deploy_and_run(binary, input_data, config, expected_output=ref_output, logs=logs)
-                    add_log({"stage": f"Iteration {iteration} (TARGET)", "status": "Complete", "details": f"Output shape: {actual_output.shape} | Values: {actual_output.flatten()[:5].tolist()}"})
-                except Exception as e:
-                    execution_error = str(e)
-                    add_log({"stage": f"Iteration {iteration} (TARGET)", "status": "Execution Failed", "details": execution_error})
-                    # Print to console for debugging
-                    print(f"❌ Execution error on iteration {iteration}: {execution_error}")
-                    
-                    # Check if it's a connection/deployment error (not fixable by AI)
-                    if "No Android devices connected" in execution_error or "ADB not found" in execution_error or "SSH connection" in execution_error:
-                        add_log({"stage": "Result", "status": "Failed", "details": "Deployment error - cannot reach target device. Fix connection settings."})
+            # Run on TARGET - ALWAYS REQUIRED, NO MOCK MODE
+            if not (config.connection_type and (config.connection_type == "adb" or config.connection_type == "ssh" or config.connection_type == "local")):
+                add_log({"stage": "Result", "status": "Failed", "details": "❌ NO DEPLOYMENT METHOD CONFIGURED!\n\nYou MUST configure a connection method:\n- ADB (Android device)\n- SSH (remote server)\n- Local (compile and run on host)\n\nGo to device settings and select a connection type. NO MOCK EXECUTION ALLOWED!"})
+                return logs
+            
+            add_log({"stage": f"Iteration {iteration} (TARGET)", "status": "Deploying", "details": f"Pushing to {config.connection_type} device..."})
+            try:
+                actual_output = self.runner.deploy_and_run(binary, input_data, config, expected_output=ref_output, logs=logs)
+                add_log({"stage": f"Iteration {iteration} (TARGET)", "status": "Complete", "details": f"Output shape: {actual_output.shape} | Values: {actual_output.flatten()[:5].tolist()}"})
+            except Exception as e:
+                execution_error = str(e)
+                # Track error for loop detection (use first 100 chars as signature)
+                error_signature = execution_error[:100]
+                error_history.append(error_signature)
+                
+                add_log({"stage": f"Iteration {iteration} (TARGET)", "status": "Execution Failed", "details": execution_error})
+                # Print to console for debugging
+                print(f"❌ Execution error on iteration {iteration}: {execution_error}")
+                
+                # IMMEDIATE loop detection - check right after adding error
+                if len(error_history) >= 3:
+                    last_three = error_history[-3:]
+                    if all(e == last_three[0] for e in last_three):
+                        add_log({"stage": "Result", "status": "Failed", "details": f"⚠️ STUCK IN LOOP: Same error repeated 3 times!\n\nError: {error_signature}\n\nThis is a SYSTEM/INFRASTRUCTURE issue, NOT a code issue. The AI cannot fix this by changing code.\n\n🔍 Root Cause Analysis:\nThe binary compiles successfully but fails to link OpenCL symbols at runtime.\nThis means the OpenCL library exists but the dynamic linker can't find/load it.\n\n✅ Possible Solutions:\n1. **SELinux Issue**: Android SELinux blocks loading from /data/local/tmp\n   → Try: adb shell setenforce 0 (requires root)\n   → Or: Use system library path only\n\n2. **Library Architecture Mismatch**: Wrong 32-bit vs 64-bit\n   → Verify: adb shell 'file /vendor/lib64/libOpenCL.so' shows 'aarch64'\n   → Verify: Binary is also 64-bit ARM\n\n3. **Missing OpenCL on Device**: Device doesn't actually support OpenCL\n   → Test: adb shell 'ls -l /vendor/lib*/libOpenCL.so'\n   → Try: Run on different device\n\n4. **Try Local Execution First**:\n   → Change connection_type to 'local'\n   → Test on your Mac to verify code works\n   → Then debug device-specific issues\n\n❌ STOP WASTING ITERATIONS - FIX THE SYSTEM ISSUE FIRST!"})
                         return logs
+                
+                # Check if it's a connection/deployment error (not fixable by AI)
+                if "No Android devices connected" in execution_error or "ADB not found" in execution_error or "SSH connection" in execution_error:
+                    add_log({"stage": "Result", "status": "Failed", "details": "Deployment error - cannot reach target device. Fix connection settings."})
+                    return logs
+                
+                # Try AI fix if not last iteration and it's a code/runtime error
+                if ref_output is not None and iteration < max_iterations - 1:
+                    add_log({"stage": f"Iteration {iteration}", "status": "Attempting AI Fix", "details": "Asking AI to fix execution error..."})
+                    try:
+                        with open(reference_model_path, 'r') as f:
+                            ref_content = f.read()
+                        
+                        # Enhanced error feedback with specific guidance
+                        error_guidance = "Fix the code to execute successfully on the target device."
+                        
+                        # Specific guidance for common OpenCL errors
+                        if "cannot locate symbol" in execution_error and "cl" in execution_error.lower():
+                            error_guidance += "\n\nOPENCL LINKING ERROR DETECTED:\nThe OpenCL library (libOpenCL.so) is not being found at runtime.\nNote: The library should already be pushed to the device at /data/local/tmp/libOpenCL.so.\n\nPossible fixes:\n1. Check that the wrapper script is using LD_LIBRARY_PATH=.\n2. Verify libOpenCL.so is in the same directory as the binary\n3. Check that all OpenCL API calls use correct function signatures\n4. Ensure you're not using deprecated OpenCL 1.x functions"
+                        elif "kernel" in execution_error.lower() and ("not found" in execution_error or "failed" in execution_error):
+                            error_guidance += "\n\nKERNEL ERROR DETECTED:\n1. Make sure kernel.cl is being read correctly from the same directory\n2. Check kernel function name matches the clCreateKernel() call\n3. Verify kernel syntax is valid OpenCL C"
+                        
+                        error_feedback = f"EXECUTION ERROR:\n{execution_error}\n\n{error_guidance}"
+                        current_code = self.generator.generate(ref_content, target, iteration + 1, error_feedback=error_feedback, debug_instructions=debug_instructions, device_config=config, project_context=project_context)
+                        add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code to fix execution error"})
+                        continue
+                    except Exception as fix_error:
+                        add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Failed", "details": str(fix_error)})
+                continue
+            
+            # Compare with reference if available
+            if ref_output is not None:
+                add_log({"stage": f"Iteration {iteration}", "status": "Comparing", "details": f"HOST shape: {ref_output.shape} | TARGET shape: {actual_output.shape}"})
+                
+                # Check shape match
+                if ref_output.shape != actual_output.shape:
+                    shape_error = f"Expected {ref_output.shape}, got {actual_output.shape}"
+                    add_log({"stage": f"Iteration {iteration}", "status": "Shape Mismatch", "details": shape_error})
                     
-                    # Try AI fix if not last iteration and it's a code/runtime error
-                    if ref_output is not None and iteration < max_iterations - 1:
-                        add_log({"stage": f"Iteration {iteration}", "status": "Attempting AI Fix", "details": "Asking AI to fix execution error..."})
+                    # Try AI fix if not last iteration
+                    if iteration < max_iterations - 1:
+                        add_log({"stage": f"Iteration {iteration}", "status": "Attempting AI Fix", "details": "Asking AI to fix shape mismatch..."})
                         try:
                             with open(reference_model_path, 'r') as f:
                                 ref_content = f.read()
                             
-                            error_feedback = f"EXECUTION ERROR:\n{execution_error}\n\nFix the code to execute successfully on the target device."
-                            fixed_code = self.generator.generate(ref_content, target, iteration + 1, error_feedback=error_feedback, debug_instructions=debug_instructions, device_config=config)
-                            current_code = fixed_code
-                            add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code to fix execution error"})
+                            # Generate new code with error feedback
+                            error_feedback = f"OUTPUT SHAPE MISMATCH:\nExpected output shape: {ref_output.shape}\nActual output shape: {actual_output.shape}\n\nThe C code is not producing the correct output shape. Make sure:\n1. You're writing ALL output values to output.bin (not just the first element)\n2. The fwrite() call writes the complete array: fwrite(output_array, sizeof(float), TOTAL_OUTPUT_SIZE, fp)\n3. TOTAL_OUTPUT_SIZE should be the product of all output dimensions"
+                            current_code = self.generator.generate(ref_content, target, iteration + 1, error_feedback=error_feedback, debug_instructions=debug_instructions, device_config=config, project_context=project_context)
+                            # Extract preview for logging
+                            code_preview = current_code.get("host_code", "")[:500] if isinstance(current_code, dict) else current_code[:500]
+                            add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code to fix shape", "source_preview": code_preview + "..." if len(code_preview) >= 500 else code_preview})
                             continue
                         except Exception as fix_error:
                             add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Failed", "details": str(fix_error)})
-                    continue
+                            continue
+                    else:
+                        add_log({"stage": "Result", "status": "Failed", "details": f"Shape mismatch after {max_iterations} iterations"})
+                        break
                 
-                # Compare with reference if available
-                if ref_output is not None:
-                    add_log({"stage": f"Iteration {iteration}", "status": "Comparing", "details": f"HOST shape: {ref_output.shape} | TARGET shape: {actual_output.shape}"})
-                    
-                    # Check shape match
-                    if ref_output.shape != actual_output.shape:
-                        shape_error = f"Expected {ref_output.shape}, got {actual_output.shape}"
-                        add_log({"stage": f"Iteration {iteration}", "status": "Shape Mismatch", "details": shape_error})
-                        
-                        # Try AI fix if not last iteration
-                        if iteration < max_iterations - 1:
-                            add_log({"stage": f"Iteration {iteration}", "status": "Attempting AI Fix", "details": "Asking AI to fix shape mismatch..."})
-                            try:
-                                with open(reference_model_path, 'r') as f:
-                                    ref_content = f.read()
-                                
-                                # Generate new code with error feedback
-                                error_feedback = f"OUTPUT SHAPE MISMATCH:\nExpected output shape: {ref_output.shape}\nActual output shape: {actual_output.shape}\n\nThe C code is not producing the correct output shape. Make sure:\n1. You're writing ALL output values to output.bin (not just the first element)\n2. The fwrite() call writes the complete array: fwrite(output_array, sizeof(float), TOTAL_OUTPUT_SIZE, fp)\n3. TOTAL_OUTPUT_SIZE should be the product of all output dimensions"
-                                fixed_code = self.generator.generate(ref_content, target, iteration + 1, error_feedback=error_feedback, debug_instructions=debug_instructions, device_config=config)
-                                current_code = fixed_code
-                                add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code to fix shape", "source_preview": fixed_code[:500] + "..." if len(fixed_code) > 500 else fixed_code})
-                                continue
-                            except Exception as fix_error:
-                                add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Failed", "details": str(fix_error)})
-                                continue
-                        else:
-                            add_log({"stage": "Result", "status": "Failed", "details": f"Shape mismatch after {max_iterations} iterations"})
-                            break
-                    
-                    # Compute difference
-                    diff = np.linalg.norm(ref_output - actual_output)
-                    add_log({"stage": f"Iteration {iteration}", "status": "Verified", "details": f"L2 Diff: {diff:.4f} | Threshold: 1e-4"})
-                    
-                    best_diff = min(best_diff, diff)
-                    
-                    if diff < 1e-4:
-                        add_log({"stage": "Result", "status": "Success", "details": f"Code matches reference! Converged in iteration {iteration}"})
-                        return logs
-                    elif iteration < max_iterations - 1:
-                        # Try AI fix for value mismatch
-                        add_log({"stage": f"Iteration {iteration}", "status": "Attempting AI Fix", "details": f"L2 diff too high ({diff:.4f}), asking AI to improve..."})
-                        try:
-                            with open(reference_model_path, 'r') as f:
-                                ref_content = f.read()
-                            
-                            error_feedback = f"OUTPUT VALUE MISMATCH:\nL2 norm difference: {diff:.4f} (threshold: 1e-4)\nExpected output: {ref_output.flatten()[:10]}\nActual output: {actual_output.flatten()[:10]}\n\nThe computation is producing incorrect values. Review the model logic and ensure all operations match the PyTorch reference exactly."
-                            fixed_code = self.generator.generate(ref_content, target, iteration + 1, error_feedback=error_feedback, debug_instructions=debug_instructions, device_config=config)
-                            current_code = fixed_code
-                            add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated improved code version", "source_preview": fixed_code[:500] + "..." if len(fixed_code) > 500 else fixed_code})
-                        except Exception as fix_error:
-                            add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Failed", "details": str(fix_error)})
-                else:
-                    # No reference, just report success
-                    add_log({"stage": "Result", "status": "Success", "details": "Code executed successfully (no reference comparison)"})
+                # Compute difference
+                diff = np.linalg.norm(ref_output - actual_output)
+                add_log({"stage": f"Iteration {iteration}", "status": "Verified", "details": f"L2 Diff: {diff:.4f} | Threshold: 1e-4"})
+                
+                best_diff = min(best_diff, diff)
+                
+                if diff < 1e-4:
+                    add_log({"stage": "Result", "status": "Success", "details": f"Code matches reference! Converged in iteration {iteration}"})
                     return logs
+                elif iteration < max_iterations - 1:
+                    # Try AI fix for value mismatch
+                    add_log({"stage": f"Iteration {iteration}", "status": "Attempting AI Fix", "details": f"L2 diff too high ({diff:.4f}), asking AI to improve..."})
+                    try:
+                        with open(reference_model_path, 'r') as f:
+                            ref_content = f.read()
+                        
+                        error_feedback = f"OUTPUT VALUE MISMATCH:\nL2 norm difference: {diff:.4f} (threshold: 1e-4)\nExpected output: {ref_output.flatten()[:10]}\nActual output: {actual_output.flatten()[:10]}\n\nThe computation is producing incorrect values. Review the model logic and ensure all operations match the PyTorch reference exactly."
+                        current_code = self.generator.generate(ref_content, target, iteration + 1, error_feedback=error_feedback, debug_instructions=debug_instructions, device_config=config, project_context=project_context)
+                        # Extract preview for logging
+                        code_preview = current_code.get("host_code", "")[:500] if isinstance(current_code, dict) else current_code[:500]
+                        add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated improved code version", "source_preview": code_preview + "..." if len(code_preview) >= 500 else code_preview})
+                    except Exception as fix_error:
+                        add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Failed", "details": str(fix_error)})
             else:
-                # Mock mode
-                add_log({"stage": f"Iteration {iteration}", "status": "Mock Mode", "details": "Enable ADB to test on real device"})
-                add_log({"stage": "Result", "status": "Success", "details": "Code compiled successfully (mock execution)"})
+                # No reference, just report success
+                add_log({"stage": "Result", "status": "Success", "details": "Code executed successfully (no reference comparison)"})
                 return logs
         
         # After all iterations

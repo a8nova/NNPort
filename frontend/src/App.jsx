@@ -40,7 +40,7 @@ function App() {
   const [manualRefFile, setManualRefFile] = useState(null)
   const [testResult, setTestResult] = useState(null)
   const [testLoading, setTestLoading] = useState(false)
-  const [maxIterations, setMaxIterations] = useState(3)
+  const [maxIterations, setMaxIterations] = useState(5)
   const [debugInstructions, setDebugInstructions] = useState('')
   const [recentFiles, setRecentFiles] = useState(() => {
     const saved = localStorage.getItem('nnport-recent-files')
@@ -81,6 +81,54 @@ function App() {
     }
   }
 
+  const handleFolderUpload = async (e) => {
+    const files = Array.from(e.target.files)
+    if (files.length === 0) return
+    
+    // Filter for relevant GPU project files
+    const validFiles = files.filter(f => {
+      const ext = f.name.split('.').pop().toLowerCase()
+      return ['cpp', 'c', 'h', 'hpp', 'cu', 'cl', 'cuh', 'metal', 'glsl'].includes(ext)
+    })
+    
+    if (validFiles.length === 0) {
+      setError('No valid GPU source files found in folder (.cpp, .c, .h, .cu, .cl, etc.)')
+      return
+    }
+    
+    const formData = new FormData()
+    // Get folder name from first file's path
+    const folderPath = validFiles[0].webkitRelativePath || validFiles[0].name
+    const folderName = folderPath.split('/')[0] || 'project'
+    formData.append('folder_name', folderName)
+    
+    // Add all files with their relative paths
+    validFiles.forEach(file => {
+      const relativePath = file.webkitRelativePath || file.name
+      formData.append('files', file, relativePath)
+    })
+    
+    try {
+      setLoading(true)
+      const res = await fetch('/upload-project', { method: 'POST', body: formData })
+      if (!res.ok) throw new Error('Folder upload failed')
+      const data = await res.json()
+      
+      // Set the main source file (first .cpp/.cu/.cl file)
+      const mainFile = data.main_file || data.files[0]
+      setManualSourceFile(mainFile)
+      addToRecent(mainFile, 'cpp')
+      
+      // Show success message with file count
+      setError(null)
+      console.log(`✅ Uploaded ${data.files.length} files from project: ${folderName}`)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const handlePort = async () => {
     if (!sourceFile) return
     try {
@@ -110,10 +158,18 @@ function App() {
         const wsUrl = `ws://localhost:8000/ws/port/${data.job_id}`
         const ws = new WebSocket(wsUrl)
         
+        // Safety timeout: force reset after 10 minutes
+        const timeoutId = setTimeout(() => {
+          console.warn('⚠️ Job timeout - forcing reset')
+          setLoading(false)
+          ws.close()
+        }, 600000) // 10 minutes
+        
         ws.onopen = () => console.log('WebSocket connected')
         ws.onmessage = (event) => {
           const message = JSON.parse(event.data)
           if (message.type === 'job_complete') {
+            clearTimeout(timeoutId)
             setLogs(message.logs || [])
             setLoading(false)
             ws.close()
@@ -122,7 +178,14 @@ function App() {
           }
         }
         ws.onerror = () => {
+          clearTimeout(timeoutId)
           setError('WebSocket connection error')
+          setLoading(false)
+        }
+        ws.onclose = () => {
+          clearTimeout(timeoutId)
+          console.log('🔌 WebSocket closed')
+          // Always reset loading state when connection closes
           setLoading(false)
         }
       } else {
@@ -165,6 +228,13 @@ function App() {
         const wsUrl = `ws://localhost:8000/ws/port/${data.job_id}`
         const ws = new WebSocket(wsUrl)
         
+        // Safety timeout: force reset after 10 minutes
+        const timeoutId = setTimeout(() => {
+          console.warn('⚠️ Job timeout - forcing reset')
+          setLoading(false)
+          ws.close()
+        }, 600000) // 10 minutes
+        
         ws.onopen = () => {
           console.log('✅ WebSocket connected for job:', data.job_id)
         }
@@ -174,6 +244,7 @@ function App() {
           console.log('📨 Received WebSocket message:', message)
           
           if (message.type === 'job_complete') {
+            clearTimeout(timeoutId)
             console.log('✅ Job complete, final logs:', message.logs)
             setLogs(message.logs || [])
             setLoading(false)
@@ -190,13 +261,17 @@ function App() {
         }
         
         ws.onerror = (error) => {
+          clearTimeout(timeoutId)
           console.error('❌ WebSocket error:', error)
           setError('WebSocket connection error')
           setLoading(false)
         }
         
         ws.onclose = () => {
+          clearTimeout(timeoutId)
           console.log('🔌 WebSocket closed')
+          // Always reset loading state when connection closes
+          setLoading(false)
         }
       } else {
         setLogs(data.logs)
@@ -383,12 +458,58 @@ function App() {
         ) : (
           <>
             <div className="control-group">
-              <label className="control-label">C++ Source Code</label>
-              <input
-                type="file"
-                accept=".cpp,.c,.cl,.cu"
-                onChange={(e) => handleUploadGeneric(e.target.files[0], setManualSourceFile, 'cpp')}
-              />
+              <label className="control-label">
+                GPU Project / Source Code
+                <span style={{ fontSize: '0.75rem', marginLeft: '0.5rem', color: 'var(--text-secondary)' }}>
+                  (Upload single file OR entire folder)
+                </span>
+              </label>
+              
+              <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                {/* Single file upload */}
+                <label style={{ 
+                  flex: 1,
+                  padding: '0.5rem',
+                  borderRadius: 'var(--radius)',
+                  cursor: 'pointer',
+                  textAlign: 'center',
+                  background: 'rgba(255,255,255,0.1)',
+                  border: '1px solid var(--border)',
+                  fontSize: '0.85rem'
+                }}>
+                  📄 Upload File
+                  <input
+                    type="file"
+                    accept=".cpp,.c,.cl,.cu,.h,.hpp"
+                    onChange={(e) => handleUploadGeneric(e.target.files[0], setManualSourceFile, 'cpp')}
+                    style={{ display: 'none' }}
+                  />
+                </label>
+                
+                {/* Folder upload */}
+                <label style={{ 
+                  flex: 1,
+                  padding: '0.5rem',
+                  borderRadius: 'var(--radius)',
+                  cursor: 'pointer',
+                  textAlign: 'center',
+                  background: 'rgba(106, 90, 205, 0.2)',
+                  border: '1px solid #6A5ACD',
+                  fontSize: '0.85rem',
+                  color: '#A494F0'
+                }}>
+                  📁 Upload Folder
+                  <input
+                    type="file"
+                    webkitdirectory=""
+                    directory=""
+                    multiple
+                    onChange={handleFolderUpload}
+                    style={{ display: 'none' }}
+                  />
+                </label>
+              </div>
+              
               {manualSourceFile && <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--success)' }}>✓ {manualSourceFile}</div>}
               {recentFiles.filter(f => f.type === 'cpp').slice(0, 3).length > 0 && (
                 <div style={{ marginTop: '0.5rem', fontSize: '0.75rem' }}>
@@ -489,13 +610,13 @@ function App() {
             <input
               type="number"
               min="1"
-              max="10"
+              max="20"
               value={maxIterations}
-              onChange={(e) => setMaxIterations(parseInt(e.target.value) || 3)}
+              onChange={(e) => setMaxIterations(parseInt(e.target.value) || 5)}
               style={{ width: '100%' }}
             />
             <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.25rem' }}>
-              Number of cross-compile → deploy → test → fix cycles (1-10)
+              Number of cross-compile → deploy → test → fix cycles (1-20, default: 5)
             </div>
           </div>
 
@@ -733,15 +854,17 @@ function App() {
               <div>
                 <h3 style={{ fontSize: '0.9rem', marginBottom: '1rem', color: 'var(--accent)' }}>📱 TARGET (Device)</h3>
                 <div className="logs-container">
-                  {logs && logs.filter(log => log.stage?.includes('TARGET') || log.stage?.includes('Iteration') || log.stage?.includes('Compil') || log.stage?.includes('Result')).map((log, i) => (
-                    <div key={i} style={{ marginBottom: '1rem', borderLeft: log.status === 'Success' ? '3px solid var(--success)' : '3px solid var(--border)', paddingLeft: '1rem' }}>
+                  {logs && logs.filter(log => log.stage?.includes('TARGET') || log.stage?.includes('Iteration') || log.stage?.includes('Compil') || log.stage?.includes('Result') || log.stage?.includes('Device Output')).map((log, i) => (
+                    <div key={i} style={{ marginBottom: '1rem', borderLeft: log.status === 'Success' ? '3px solid var(--success)' : log.stage === 'Device Output' ? '3px solid #00d4aa' : '3px solid var(--border)', paddingLeft: '1rem' }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                         <div>
-                          <span style={{ fontWeight: '600', color: 'var(--accent)' }}>{log.stage}</span>
+                          <span style={{ fontWeight: '600', color: log.stage === 'Device Output' ? '#00d4aa' : 'var(--accent)' }}>{log.stage}</span>
+                          {log.execution_time && <span style={{ marginLeft: '0.5rem', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>⏱️ {log.execution_time}</span>}
                           <span style={{
                             marginLeft: '1rem',
                             color: log.status === 'Success' ? 'var(--success)' :
-                              log.status === 'Failed' ? 'var(--error)' : 'var(--text-primary)'
+                              log.status === 'Failed' ? 'var(--error)' : 
+                              log.status === 'Info' ? '#00d4aa' : 'var(--text-primary)'
                           }}>{log.status}</span>
                         </div>
                         {log.status === 'Success' && log.source_preview && (
@@ -768,7 +891,19 @@ function App() {
                         )}
                       </div>
                       {log.details && (
-                        <div style={{ marginTop: '0.5rem', fontSize: '0.85rem', color: 'var(--text-secondary)', whiteSpace: 'pre-wrap' }}>
+                        <div style={{ 
+                          marginTop: '0.5rem', 
+                          fontSize: log.stage === 'Device Output' ? '0.8rem' : '0.85rem', 
+                          color: log.stage === 'Device Output' ? '#00ff00' : 'var(--text-secondary)', 
+                          whiteSpace: 'pre-wrap',
+                          backgroundColor: log.stage === 'Device Output' ? '#0a0a0a' : 'transparent',
+                          padding: log.stage === 'Device Output' ? '0.75rem' : '0',
+                          borderRadius: log.stage === 'Device Output' ? '4px' : '0',
+                          fontFamily: log.stage === 'Device Output' ? 'monospace' : 'inherit',
+                          maxHeight: log.stage === 'Device Output' ? '400px' : 'none',
+                          overflowY: log.stage === 'Device Output' ? 'auto' : 'visible',
+                          border: log.stage === 'Device Output' ? '1px solid #00d4aa' : 'none'
+                        }}>
                           {log.details}
                         </div>
                       )}
