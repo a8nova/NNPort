@@ -38,6 +38,15 @@ function App() {
   const [activeTab, setActiveTab] = useState('auto') // 'auto' or 'manual'
   const [manualSourceFile, setManualSourceFile] = useState(null)
   const [manualRefFile, setManualRefFile] = useState(null)
+  const [manualProjectMode, setManualProjectMode] = useState('upload') // 'upload' | 'local'
+  const [localProjectPath, setLocalProjectPath] = useState('')
+  const [localEntrypoint, setLocalEntrypoint] = useState('')
+  const [allowLocalWrite, setAllowLocalWrite] = useState(false)
+  const [localPickerOpen, setLocalPickerOpen] = useState(false)
+  const [localPickerQuery, setLocalPickerQuery] = useState('')
+  const [localPickerLoading, setLocalPickerLoading] = useState(false)
+  const [localPickerResults, setLocalPickerResults] = useState([])
+  const [localDetectedEntrypoint, setLocalDetectedEntrypoint] = useState(null)
   const [testResult, setTestResult] = useState(null)
   const [testLoading, setTestLoading] = useState(false)
   const [maxIterations, setMaxIterations] = useState(5)
@@ -199,23 +208,42 @@ function App() {
   }
 
   const handleVerify = async () => {
-    if (!manualSourceFile || !manualRefFile) return
+    if (!manualRefFile) return
+    if (manualProjectMode === 'upload' && !manualSourceFile) return
+    if (manualProjectMode === 'local' && (!localProjectPath || !allowLocalWrite)) return
     try {
       setLoading(true)
       setError(null)
       setLogs([])
-      const res = await fetch('/verify', {
+
+      const payloadCommon = {
+        target_type: targetType,
+        device_config: deviceConfig,
+        input_shape: inputShape.split(',').map(n => parseInt(n.trim())),
+        max_iterations: maxIterations,
+        debug_instructions: debugInstructions,
+      }
+
+      const endpoint = manualProjectMode === 'local' ? '/verify-local' : '/verify'
+      const body =
+        manualProjectMode === 'local'
+          ? {
+              ...payloadCommon,
+              project_path: localProjectPath.trim(),
+              entrypoint: localEntrypoint.trim() || null,
+              reference_filename: manualRefFile,
+              allow_write: true,
+            }
+          : {
+              ...payloadCommon,
+              source_filename: manualSourceFile,
+              reference_filename: manualRefFile,
+            }
+
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          source_filename: manualSourceFile,
-          reference_filename: manualRefFile,
-          target_type: targetType,
-          device_config: deviceConfig,
-          input_shape: inputShape.split(',').map(n => parseInt(n.trim())),
-          max_iterations: maxIterations,
-          debug_instructions: debugInstructions,
-        }),
+        body: JSON.stringify(body),
       })
       if (!res.ok) {
         const err = await res.json()
@@ -280,6 +308,40 @@ function App() {
     } catch (err) {
       setError(err.message)
       setLoading(false)
+    }
+  }
+
+  const openLocalPicker = async () => {
+    try {
+      setLocalPickerOpen(true)
+      setLocalPickerLoading(true)
+      setLocalPickerResults([])
+      const res = await fetch(`/local-projects?query=${encodeURIComponent(localPickerQuery || '')}&limit=100`)
+      const data = await res.json()
+      setLocalPickerResults(data.projects || [])
+    } catch (e) {
+      setError(e.message || 'Failed to load local projects')
+    } finally {
+      setLocalPickerLoading(false)
+    }
+  }
+
+  const analyzeAndSetEntrypoint = async (projectPath) => {
+    try {
+      const res = await fetch('/analyze-local-project', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_path: projectPath }),
+      })
+      if (!res.ok) return
+      const data = await res.json()
+      setLocalDetectedEntrypoint(data.selected_entrypoint || null)
+      // Keep the entrypoint field optional; we show the detected one and only fill if user wants.
+      if (!localEntrypoint.trim() && data.selected_entrypoint) {
+        setLocalEntrypoint('')
+      }
+    } catch {
+      // non-fatal
     }
   }
 
@@ -457,6 +519,54 @@ function App() {
           </div>
         ) : (
           <>
+            {/* Project mode switcher */}
+            <div className="control-group">
+              <label className="control-label">Project Mode</label>
+              <div style={{ display: 'flex', gap: '0.5rem' }}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setManualProjectMode('upload')
+                    setAllowLocalWrite(false)
+                    setError(null)
+                  }}
+                  style={{
+                    flex: 1,
+                    padding: '0.6rem',
+                    borderRadius: 'var(--radius)',
+                    border: '1px solid var(--border)',
+                    background: manualProjectMode === 'upload' ? 'rgba(255,255,255,0.12)' : 'transparent',
+                    cursor: 'pointer',
+                    fontWeight: 600,
+                  }}
+                >
+                  Upload folder (safe)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setManualProjectMode('local')
+                    setError(null)
+                  }}
+                  style={{
+                    flex: 1,
+                    padding: '0.6rem',
+                    borderRadius: 'var(--radius)',
+                    border: '1px solid #ff6b6b',
+                    background: manualProjectMode === 'local' ? 'rgba(255, 107, 107, 0.12)' : 'transparent',
+                    cursor: 'pointer',
+                    fontWeight: 700,
+                    color: manualProjectMode === 'local' ? '#ff6b6b' : 'var(--text-primary)',
+                  }}
+                >
+                  Local path (edits your project)
+                </button>
+              </div>
+              <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginTop: '0.4rem' }}>
+                Upload mode edits a temp copy. Local path mode edits your real folder and keeps backups under <code>.nnport_backups/</code>.
+              </div>
+            </div>
+
             <div className="control-group">
               <label className="control-label">
                 GPU Project / Source Code
@@ -465,50 +575,196 @@ function App() {
                 </span>
               </label>
               
-              <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.5rem' }}>
-                {/* Single file upload */}
-                <label style={{ 
-                  flex: 1,
-                  padding: '0.5rem',
-                  borderRadius: 'var(--radius)',
-                  cursor: 'pointer',
-                  textAlign: 'center',
-                  background: 'rgba(255,255,255,0.1)',
-                  border: '1px solid var(--border)',
-                  fontSize: '0.85rem'
-                }}>
-                  📄 Upload File
+              {manualProjectMode === 'upload' ? (
+                <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                  {/* Single file upload */}
+                  <label style={{ 
+                    flex: 1,
+                    padding: '0.5rem',
+                    borderRadius: 'var(--radius)',
+                    cursor: 'pointer',
+                    textAlign: 'center',
+                    background: 'rgba(255,255,255,0.1)',
+                    border: '1px solid var(--border)',
+                    fontSize: '0.85rem'
+                  }}>
+                    📄 Upload File
+                    <input
+                      type="file"
+                      accept=".cpp,.c,.cl,.cu,.h,.hpp"
+                      onChange={(e) => handleUploadGeneric(e.target.files[0], setManualSourceFile, 'cpp')}
+                      style={{ display: 'none' }}
+                    />
+                  </label>
+                  
+                  {/* Folder upload */}
+                  <label style={{ 
+                    flex: 1,
+                    padding: '0.5rem',
+                    borderRadius: 'var(--radius)',
+                    cursor: 'pointer',
+                    textAlign: 'center',
+                    background: 'rgba(106, 90, 205, 0.2)',
+                    border: '1px solid #6A5ACD',
+                    fontSize: '0.85rem',
+                    color: '#A494F0'
+                  }}>
+                    📁 Upload Folder
+                    <input
+                      type="file"
+                      webkitdirectory=""
+                      directory=""
+                      multiple
+                      onChange={handleFolderUpload}
+                      style={{ display: 'none' }}
+                    />
+                  </label>
+                </div>
+              ) : (
+                <div style={{ marginBottom: '0.75rem' }}>
+                  <div style={{
+                    padding: '0.75rem',
+                    borderRadius: 'var(--radius)',
+                    border: '1px solid #ff6b6b',
+                    background: 'rgba(255, 107, 107, 0.08)',
+                    marginBottom: '0.6rem',
+                    fontSize: '0.85rem',
+                    lineHeight: 1.35
+                  }}>
+                    <div style={{ fontWeight: 800, marginBottom: '0.25rem' }}>Edits your real project folder</div>
+                    <div style={{ color: 'var(--text-secondary)' }}>
+                      NNPort will write fixes directly into the folder you specify and store rollback backups in <code>.nnport_backups/</code>.
+                      <br />
+                      Tip (macOS): Finder → right click folder → hold Option → “Copy as Pathname”.
+                    </div>
+                  </div>
+
+                  <label className="control-label" style={{ marginTop: '0.25rem' }}>Project path</label>
+                  <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    <input
+                      type="text"
+                      placeholder="Click Find… to pick a local folder"
+                      value={localProjectPath}
+                      onChange={(e) => setLocalProjectPath(e.target.value)}
+                      style={{ fontFamily: 'monospace', fontSize: '0.85rem', flex: 1 }}
+                    />
+                    <button
+                      type="button"
+                      onClick={openLocalPicker}
+                      style={{
+                        padding: '0.55rem 0.75rem',
+                        borderRadius: 'var(--radius)',
+                        border: '1px solid var(--border)',
+                        background: 'rgba(255,255,255,0.08)',
+                        cursor: 'pointer',
+                        fontWeight: 700,
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      Find…
+                    </button>
+                  </div>
+
+                  {localPickerOpen && (
+                    <div style={{
+                      marginTop: '0.6rem',
+                      border: '1px solid var(--border)',
+                      borderRadius: 'var(--radius)',
+                      padding: '0.75rem',
+                      background: 'rgba(0,0,0,0.15)'
+                    }}>
+                      <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.5rem' }}>
+                        <input
+                          type="text"
+                          placeholder="Filter (e.g. examples, myproj)…"
+                          value={localPickerQuery}
+                          onChange={(e) => setLocalPickerQuery(e.target.value)}
+                          style={{ flex: 1, fontFamily: 'monospace', fontSize: '0.85rem' }}
+                        />
+                        <button
+                          type="button"
+                          onClick={openLocalPicker}
+                          disabled={localPickerLoading}
+                          style={{ padding: '0.5rem 0.75rem', fontWeight: 700 }}
+                        >
+                          {localPickerLoading ? 'Searching…' : 'Search'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setLocalPickerOpen(false)}
+                          style={{ padding: '0.5rem 0.75rem' }}
+                        >
+                          Close
+                        </button>
+                      </div>
+
+                      <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', marginBottom: '0.5rem' }}>
+                        Showing projects from <code>~/Projects</code> on the backend host.
+                      </div>
+
+                      <div style={{ maxHeight: '220px', overflow: 'auto', borderTop: '1px solid var(--border)', paddingTop: '0.5rem' }}>
+                        {localPickerLoading && <div style={{ fontSize: '0.85rem' }}>Loading…</div>}
+                        {!localPickerLoading && localPickerResults.length === 0 && (
+                          <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+                            No results. Try a different filter.
+                          </div>
+                        )}
+                        {!localPickerLoading && localPickerResults.map((p) => (
+                          <div
+                            key={p}
+                            onClick={async () => {
+                              setLocalProjectPath(p)
+                              setLocalPickerOpen(false)
+                              setError(null)
+                              await analyzeAndSetEntrypoint(p)
+                            }}
+                            style={{
+                              cursor: 'pointer',
+                              padding: '0.35rem 0.25rem',
+                              fontFamily: 'monospace',
+                              fontSize: '0.8rem',
+                              color: 'var(--accent)',
+                              borderRadius: '6px',
+                            }}
+                          >
+                            {p}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <label className="control-label" style={{ marginTop: '0.5rem' }}>
+                    Entrypoint (optional)
+                    <span style={{ fontSize: '0.75rem', marginLeft: '0.5rem', color: 'var(--text-secondary)' }}>
+                      (relative path, leave blank to auto-detect main())
+                    </span>
+                  </label>
                   <input
-                    type="file"
-                    accept=".cpp,.c,.cl,.cu,.h,.hpp"
-                    onChange={(e) => handleUploadGeneric(e.target.files[0], setManualSourceFile, 'cpp')}
-                    style={{ display: 'none' }}
+                    type="text"
+                    placeholder="src/main.cpp"
+                    value={localEntrypoint}
+                    onChange={(e) => setLocalEntrypoint(e.target.value)}
+                    style={{ fontFamily: 'monospace', fontSize: '0.85rem' }}
                   />
-                </label>
-                
-                {/* Folder upload */}
-                <label style={{ 
-                  flex: 1,
-                  padding: '0.5rem',
-                  borderRadius: 'var(--radius)',
-                  cursor: 'pointer',
-                  textAlign: 'center',
-                  background: 'rgba(106, 90, 205, 0.2)',
-                  border: '1px solid #6A5ACD',
-                  fontSize: '0.85rem',
-                  color: '#A494F0'
-                }}>
-                  📁 Upload Folder
-                  <input
-                    type="file"
-                    webkitdirectory=""
-                    directory=""
-                    multiple
-                    onChange={handleFolderUpload}
-                    style={{ display: 'none' }}
-                  />
-                </label>
-              </div>
+                  {localDetectedEntrypoint && !localEntrypoint.trim() && (
+                    <div style={{ marginTop: '0.35rem', fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
+                      Detected entrypoint: <code>{localDetectedEntrypoint}</code>
+                    </div>
+                  )}
+
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.6rem' }}>
+                    <input
+                      type="checkbox"
+                      checked={allowLocalWrite}
+                      onChange={(e) => setAllowLocalWrite(e.target.checked)}
+                    />
+                    <span style={{ fontSize: '0.85rem' }}>
+                      I understand NNPort will modify files in this folder
+                    </span>
+                  </label>
+                </div>
+              )}
               
               {manualSourceFile && <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--success)' }}>✓ {manualSourceFile}</div>}
               {recentFiles.filter(f => f.type === 'cpp').slice(0, 3).length > 0 && (
@@ -746,10 +1002,19 @@ function App() {
         ) : (
           <button
             onClick={handleVerify}
-            disabled={!manualSourceFile || !manualRefFile || loading}
+            disabled={
+              loading ||
+              !manualRefFile ||
+              (manualProjectMode === 'upload' && !manualSourceFile) ||
+              (manualProjectMode === 'local' && (!localProjectPath.trim() || !allowLocalWrite))
+            }
             style={{ width: '100%', padding: '0.75rem', fontSize: '1rem', fontWeight: '600' }}
           >
-            {loading ? `🔄 Vibing... (0/${maxIterations})` : '🔧 Vibe Debug Manual Code'}
+            {loading
+              ? `🔄 Vibing... (0/${maxIterations})`
+              : manualProjectMode === 'local'
+                ? '🛠️ Vibe Debug (Local Project)'
+                : '🔧 Vibe Debug Manual Code'}
           </button>
         )}
 

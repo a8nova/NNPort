@@ -14,6 +14,10 @@ import subprocess
 import platform
 from typing import Dict, List, Optional, Any
 import re
+import tempfile
+import urllib.request
+import zipfile
+import shutil
 
 
 class ToolchainDiscovery:
@@ -294,7 +298,40 @@ class ToolchainDiscovery:
     
     def _find_opencl(self) -> Optional[Dict[str, Any]]:
         """Find OpenCL installation"""
-        # Check common OpenCL header locations
+        # If headers aren't available on the host, we auto-download Khronos OpenCL-Headers.
+        #
+        # Source (latest on main branch):
+        #   https://github.com/KhronosGroup/OpenCL-Headers
+        # Download URL (hardcoded):
+        #   https://github.com/KhronosGroup/OpenCL-Headers/archive/refs/heads/main.zip
+        vendored_include_root = os.path.join(os.path.dirname(__file__), "opencl_sdk", "include")
+        vendored_cl_dir = os.path.join(vendored_include_root, "CL")
+        vendored_cl_h = os.path.join(vendored_cl_dir, "cl.h")
+
+        # Prefer vendored headers if already present.
+        if os.path.exists(vendored_cl_h):
+            return {
+                "headers_path": vendored_include_root,
+                "headers_source": "vendored",
+                "available_devices": [],
+            }
+
+        # Try to fetch latest OpenCL-Headers if not present.
+        try:
+            os.makedirs(vendored_include_root, exist_ok=True)
+            self._ensure_opencl_headers_downloaded(vendored_include_root)
+        except Exception:
+            # If download fails (offline / blocked), we'll fall back to system paths.
+            pass
+
+        if os.path.exists(vendored_cl_h):
+            return {
+                "headers_path": vendored_include_root,
+                "headers_source": "vendored_downloaded",
+                "available_devices": [],
+            }
+
+        # Check common OpenCL header locations on host
         header_paths = [
             "/usr/include/CL",
             "/usr/local/include/CL",
@@ -310,6 +347,58 @@ class ToolchainDiscovery:
                 }
         
         return None
+
+    def _ensure_opencl_headers_downloaded(self, vendored_include_root: str) -> None:
+        """Download and extract Khronos OpenCL-Headers into vendored_include_root.
+
+        Creates:
+          <vendored_include_root>/CL/*.h
+        """
+        cl_dir = os.path.join(vendored_include_root, "CL")
+        cl_h = os.path.join(cl_dir, "cl.h")
+        if os.path.exists(cl_h):
+            return
+
+        # NOTE: Hardcoded URL for the latest OpenCL-Headers main branch.
+        url = "https://github.com/KhronosGroup/OpenCL-Headers/archive/refs/heads/main.zip"
+
+        with tempfile.TemporaryDirectory() as td:
+            zip_path = os.path.join(td, "opencl_headers.zip")
+            # Download archive
+            urllib.request.urlretrieve(url, zip_path)  # nosec - intended download
+
+            # Extract only the CL/ directory into vendored_include_root
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                members = zf.namelist()
+                # The zip root folder is typically OpenCL-Headers-main/
+                cl_prefix = None
+                for name in members:
+                    if name.endswith("/CL/") and "OpenCL-Headers-" in name:
+                        cl_prefix = name
+                        break
+                if not cl_prefix:
+                    # Fallback: find any /CL/ directory in archive
+                    for name in members:
+                        if name.endswith("/CL/"):
+                            cl_prefix = name
+                            break
+                if not cl_prefix:
+                    raise RuntimeError("Could not locate CL/ directory inside OpenCL-Headers archive")
+
+                os.makedirs(cl_dir, exist_ok=True)
+                for name in members:
+                    if not name.startswith(cl_prefix):
+                        continue
+                    if name.endswith("/"):
+                        continue
+                    rel = name[len(cl_prefix):]
+                    # Only extract headers
+                    if not rel.endswith(".h"):
+                        continue
+                    dst = os.path.join(cl_dir, rel)
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    with zf.open(name) as src, open(dst, "wb") as out:
+                        shutil.copyfileobj(src, out)
     
     def pull_opencl_from_devices(self) -> List[Dict[str, Any]]:
         """Pull OpenCL libraries from connected devices"""

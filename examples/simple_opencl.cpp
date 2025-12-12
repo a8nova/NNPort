@@ -97,7 +97,7 @@ int main() {
     // Load kernel source
     printf("\n=== Loading Kernel ===\n");
     size_t kernel_size;
-    char* kernel_source = load_kernel_source("kernel.cl", &kernel_size);
+    char* kernel_source = load_kernel_source("simple_opencl.cl", &kernel_size);  // Update filename
     if (!kernel_source) {
         printf("Failed to load kernel source\n");
         return 1;
@@ -166,6 +166,7 @@ int main() {
     err |= clSetKernelArg(kernel, 1, sizeof(cl_mem), &weights_buf);
     err |= clSetKernelArg(kernel, 2, sizeof(cl_mem), &output_buf);
     err |= clSetKernelArg(kernel, 3, sizeof(int), &INPUT_SIZE);
+    err |= clSetKernelArg(kernel, 4, sizeof(int), &OUTPUT_SIZE);  // Add this line
     CHECK_ERROR(err, "Failed to set kernel arguments");
     
     // Execute kernel

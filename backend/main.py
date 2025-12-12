@@ -1,7 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, WebSocket, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 import shutil
 import os
 import json
@@ -24,6 +24,7 @@ from backend.api.websocket import websocket_endpoint, manager as ws_manager
 from backend.api.routes import jobs as jobs_router
 from backend.toolchain_discovery import ToolchainDiscovery, ADBDiscovery
 from backend.device_discovery import DeviceDiscovery
+from backend.project_analyzer import analyze_project
 
 app = FastAPI()
 
@@ -465,6 +466,115 @@ class VerifyRequest(BaseModel):
     max_iterations: int = 3
     debug_instructions: str = ""  # User-provided debugging context
 
+
+class VerifyLocalRequest(BaseModel):
+    # Absolute path to an existing local project folder on disk.
+    # NNPort will apply AI fixes directly to this folder.
+    project_path: str
+    # Optional relative path to a specific entrypoint file within the project.
+    # If omitted, NNPort will analyze the project and pick the best main() candidate.
+    entrypoint: Optional[str] = None
+    # Reference model can be provided either as a temp upload filename OR an absolute path.
+    reference_filename: str = "model.py"
+    reference_path: Optional[str] = None
+    target_type: TargetType = TargetType.DSP
+    device_config: DeviceConfig = DeviceConfig()
+    input_shape: List[int] = [1, 5]
+    max_iterations: int = 3
+    debug_instructions: str = ""  # User-provided debugging context
+    # Safety switch: must be true to allow modifying local folders.
+    allow_write: bool = False
+
+
+@app.get("/local-projects")
+async def local_projects(
+    query: str = Query("", description="Optional substring filter"),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """
+    List likely project folders on the server host for friendly local-path selection.
+    Intended for local dev usage (same machine as the UI).
+    """
+    root = os.path.expanduser("~/Projects")
+    root = os.path.realpath(root)
+    if not os.path.isdir(root):
+        return {"root": root, "projects": []}
+
+    q = (query or "").strip().lower()
+
+    def looks_like_project(path: str) -> bool:
+        # Fast checks: presence of build files or source files.
+        try:
+            names = set(os.listdir(path))
+        except OSError:
+            return False
+        if "CMakeLists.txt" in names or "Makefile" in names:
+            return True
+        for n in names:
+            if n.endswith((".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cl")):
+                return True
+        return False
+
+    projects = []
+    try:
+        for name in sorted(os.listdir(root)):
+            if name.startswith("."):
+                continue
+            full = os.path.join(root, name)
+            if not os.path.isdir(full):
+                continue
+            if q and q not in name.lower():
+                # also allow matching deeper folder names
+                pass
+            if looks_like_project(full):
+                projects.append(full)
+                continue
+            # one level deep scan
+            try:
+                for sub in sorted(os.listdir(full)):
+                    if sub.startswith("."):
+                        continue
+                    sub_full = os.path.join(full, sub)
+                    if not os.path.isdir(sub_full):
+                        continue
+                    if q and q not in (name + "/" + sub).lower():
+                        continue
+                    if looks_like_project(sub_full):
+                        projects.append(sub_full)
+                        break
+            except OSError:
+                continue
+            if len(projects) >= limit:
+                break
+    except OSError:
+        pass
+
+    return {"root": root, "projects": projects[:limit]}
+
+
+class AnalyzeLocalProjectRequest(BaseModel):
+    project_path: str
+
+
+@app.post("/analyze-local-project")
+async def analyze_local_project(req: AnalyzeLocalProjectRequest):
+    """Analyze a local project path and return entrypoint candidates."""
+    project_root = os.path.realpath(req.project_path)
+    if not os.path.isdir(project_root):
+        raise HTTPException(status_code=404, detail=f"Project path not found or not a directory: {project_root}")
+    if platform.system() == "Darwin" and not project_root.startswith("/Users/"):
+        raise HTTPException(status_code=400, detail="On macOS, analyze-local-project only allows project paths under /Users/ by default.")
+
+    profile = analyze_project(project_root)
+    return {
+        "project_root": project_root,
+        "has_cmake": profile.has_cmake,
+        "selected_entrypoint": profile.selected_entrypoint,
+        "main_candidates": [{"path": c.relpath, "score": c.score, "reasons": c.reasons} for c in profile.main_candidates],
+        "sources": len(profile.sources_cpp) + len(profile.sources_c),
+        "kernels": profile.kernels_cl,
+    }
+
 async def _run_verify_job(job_id: str, source_path: str, ref_path: str, req: VerifyRequest):
     """Background task to run verification"""
     # Store logs to send when WebSocket connects
@@ -525,6 +635,107 @@ async def verify_code(req: VerifyRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(_run_verify_job, job_id, source_path, ref_path, req)
     
     return {"job_id": job_id}
+
+
+async def _run_verify_local_job(job_id: str, project_path: str, entry_file: str, ref_path: str, req: VerifyLocalRequest):
+    """Background task to run verification directly on a local project folder."""
+    collected_logs = []
+
+    async def callback(message: dict):
+        collected_logs.append(message)
+        await ws_manager.broadcast(job_id, message)
+
+    job_manager.update_job(job_id, {"state": "running"})
+    await asyncio.sleep(0.5)
+
+    try:
+        logs = porting_engine.verify_manual_code(
+            manual_source_path=os.path.join(project_path, entry_file),
+            reference_model_path=ref_path,
+            target=req.target_type,
+            config=req.device_config,
+            input_shape=req.input_shape,
+            max_iterations=req.max_iterations,
+            callback=callback,
+            job_id=job_id,
+            debug_instructions=req.debug_instructions,
+        )
+        job_manager.update_job(job_id, {"state": "completed", "logs": logs})
+        for log in collected_logs:
+            await ws_manager.broadcast(job_id, log)
+        await ws_manager.broadcast(job_id, {"type": "job_complete", "status": "success", "logs": logs})
+    except Exception as e:
+        job_manager.update_job(job_id, {"state": "failed", "error": str(e)})
+        await ws_manager.broadcast(job_id, {"type": "job_complete", "status": "failed", "error": str(e)})
+
+
+@app.post("/verify-local") 
+async def verify_local(req: VerifyLocalRequest, background_tasks: BackgroundTasks):
+    """
+    Verify code by operating directly on a local project folder path.
+    This mode can APPLY AI FIXES IN-PLACE to the provided folder.
+    """
+    if not req.allow_write:
+        raise HTTPException(status_code=400, detail="verify-local requires allow_write=true to modify local folders.")
+
+    project_root = os.path.realpath(req.project_path)
+    if not os.path.isdir(project_root):
+        raise HTTPException(status_code=404, detail=f"Project path not found or not a directory: {project_root}")
+
+    # Basic safety guard: only allow paths under /Users on macOS by default.
+    # (You can relax this later if needed.)
+    if platform.system() == "Darwin" and not project_root.startswith("/Users/"):
+        raise HTTPException(status_code=400, detail="On macOS, verify-local only allows project paths under /Users/ by default.")
+
+    # Resolve reference model
+    if req.reference_path:
+        ref_path = os.path.realpath(req.reference_path)
+    else:
+        ref_path = os.path.join(UPLOAD_DIR, req.reference_filename)
+    if not os.path.exists(ref_path):
+        raise HTTPException(status_code=404, detail=f"Reference model not found: {ref_path}")
+
+    # Determine entrypoint
+    entry_file = req.entrypoint
+    if entry_file:
+        entry_abs = os.path.join(project_root, entry_file)
+        if not os.path.exists(entry_abs):
+            raise HTTPException(status_code=404, detail=f"Entrypoint not found: {entry_abs}")
+    else:
+        profile = analyze_project(project_root)
+        if not profile.selected_entrypoint:
+            raise HTTPException(status_code=400, detail="Could not find any main() in the project; please provide entrypoint explicitly.")
+        entry_file = profile.selected_entrypoint
+
+    # Ensure a manifest exists so verify_manual_code treats it as a project and can apply JSON ops in-place.
+    manifest_path = os.path.join(project_root, ".project_manifest.json")
+    if not os.path.exists(manifest_path):
+        profile = analyze_project(project_root)
+        folder_name = os.path.basename(project_root) or "project"
+        manifest = {
+            "folder_name": folder_name,
+            "files": sorted(profile.sources_cpp + profile.sources_c + profile.headers + profile.kernels_cl),
+            "main_file": entry_file,
+            "upload_time": str(os.path.getmtime(project_root)),
+            "local_path_mode": True,
+        }
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+
+    # Create job
+    job_id = job_manager.create_job(
+        {
+            "type": "verify-local",
+            "project_path": project_root,
+            "entrypoint": entry_file,
+            "reference_path": ref_path,
+            "target_type": req.target_type,
+            "input_shape": req.input_shape,
+        }
+    )
+
+    background_tasks.add_task(_run_verify_local_job, job_id, project_root, entry_file, ref_path, req)
+    return {"job_id": job_id, "project_path": project_root, "entrypoint": entry_file}
 
 async def _run_port_job(job_id: str, source_path: str, req: PortRequest):
     """Background task to run porting"""
