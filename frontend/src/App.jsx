@@ -1064,7 +1064,7 @@ function App() {
           <h2 className="section-title">Porting Progress</h2>
           {!logs && !loading ? (
             <div style={{ color: 'var(--text-secondary)', textAlign: 'center', padding: '2rem' }}>
-              Upload a model and select target hardware to begin vibe debuging.
+              Upload a model and select target hardware to begin vibe porting or debuging.
             </div>
           ) : (
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
