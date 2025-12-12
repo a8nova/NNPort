@@ -40,3 +40,23 @@
 .read-the-docs {
   color: #888;
 }
+
+.config-section {
+  margin-bottom: 1.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+}
+
+.config-section h3 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.config-section select,
+.config-section input,
+.config-section textarea {
+  width: 100%;
+  margin-bottom: 0.75rem;
+}
