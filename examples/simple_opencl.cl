@@ -3,8 +3,9 @@
 // Where weights is a 5x10 matrix of 0.5 values
 // PyTorch equivalent: output = torch.matmul(weights, input)
 //
-// NOTE: This kernel intentionally contains a bug for the NNPort demo. NNPort is expected
-// to iterate and fix this kernel during the porting/verification loop.
+// NNPORT_PROTECTED_BEGIN
+// NOTE: This comment is intentional (demo). NNPort is expected to iterate and fix issues in this project.
+// NNPORT_PROTECTED_END
 
 __kernel void linear_layer(__global const float* input, 
                           __global const float* weights,

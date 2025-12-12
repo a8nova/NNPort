@@ -17,6 +17,50 @@ class OpsValidationError(Exception):
     pass
 
 
+_PROTECTED_BEGIN = "NNPORT_PROTECTED_BEGIN"
+_PROTECTED_END = "NNPORT_PROTECTED_END"
+
+
+def _extract_protected_blocks(text: str) -> List[str]:
+    """Return a list of protected blocks (inclusive) found in text.
+
+    A protected block is any region between lines containing NNPORT_PROTECTED_BEGIN
+    and NNPORT_PROTECTED_END. The content inside must remain byte-for-byte identical
+    across updates, otherwise the op is rejected.
+    """
+    if not text:
+        return []
+    lines = text.splitlines(keepends=True)
+    blocks: List[str] = []
+    i = 0
+    while i < len(lines):
+        if _PROTECTED_BEGIN in lines[i]:
+            start = i
+            j = i + 1
+            while j < len(lines) and _PROTECTED_END not in lines[j]:
+                j += 1
+            if j < len(lines):
+                end = j
+                blocks.append("".join(lines[start : end + 1]))
+                i = end + 1
+                continue
+        i += 1
+    return blocks
+
+
+def _enforce_protected_blocks(old_text: str, new_text: str, *, path: str) -> None:
+    """Reject updates that modify or remove protected blocks."""
+    old_blocks = _extract_protected_blocks(old_text)
+    if not old_blocks:
+        return
+    new_blocks = _extract_protected_blocks(new_text)
+    if old_blocks != new_blocks:
+        raise OpsValidationError(
+            f"Protected region modified/removed in {path}. "
+            f"Do not edit text between {_PROTECTED_BEGIN} and {_PROTECTED_END}."
+        )
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -307,6 +351,12 @@ def apply_ops_in_place(
                 abs_path = _safe_abspath(project_root, op["path"])
                 if not os.path.exists(abs_path):
                     raise OpsValidationError(f"Cannot update missing file: {op['path']}")
+                # Prevent the model from deleting or rewriting protected regions.
+                try:
+                    old_text = read_file_text(abs_path)
+                except Exception:
+                    old_text = ""
+                _enforce_protected_blocks(old_text, op["content"], path=op["path"])
                 write_file_text(abs_path, op["content"])
             elif op_type == "delete":
                 abs_path = _safe_abspath(project_root, op["path"])

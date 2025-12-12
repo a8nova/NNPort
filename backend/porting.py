@@ -184,6 +184,7 @@ Rules:
 - Never use path traversal like ../
 - For updates, prefer changing as few files as possible, but ALWAYS provide full file contents for each updated/created file.
 - Ensure the resulting project compiles and runs for the specified target.
+- Do NOT modify or remove any text between lines containing NNPORT_PROTECTED_BEGIN and NNPORT_PROTECTED_END.
 """
 
         # Different prompts for OpenCL vs other targets
@@ -2533,7 +2534,38 @@ class PortingEngine:
                             )
                             run_id = f"{job_id or 'manual'}_value_{iteration}_{uuid.uuid4().hex[:8]}"
                             ws = get_nnport_workspace(project_root, create=True)
-                            apply_ops_in_place(project_root, ops_obj, run_id=run_id, backups_root=ws.backups_root)
+                            try:
+                                res = apply_ops_in_place(project_root, ops_obj, run_id=run_id, backups_root=ws.backups_root)
+                            except OpsValidationError as oe:
+                                # If the model generated ops with stale expected hashes, retry once without sha preconditions.
+                                if "SHA mismatch" in str(oe):
+                                    if isinstance(ops_obj, dict) and isinstance(ops_obj.get("ops"), list):
+                                        for op in ops_obj["ops"]:
+                                            if isinstance(op, dict):
+                                                op.pop("expected_sha256_before", None)
+                                    res = apply_ops_in_place(
+                                        project_root,
+                                        ops_obj,
+                                        run_id=run_id + "_retry",
+                                        backups_root=ws.backups_root,
+                                    )
+                                    run_id = run_id + "_retry"
+                                else:
+                                    raise
+                            # Reload project context after applying edits (so subsequent iterations use fresh file contents).
+                            try:
+                                refreshed_files = {}
+                                for relp in (project_context.get("files") or {}).keys():
+                                    abs_p = os.path.join(project_root, relp)
+                                    if os.path.exists(abs_p):
+                                        try:
+                                            with open(abs_p, "r") as pf:
+                                                refreshed_files[relp] = pf.read()
+                                        except Exception:
+                                            pass
+                                project_context["files"] = refreshed_files
+                            except Exception:
+                                pass
                             add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": f"Applied JSON ops to project (backup: .nnport_backups/{run_id})"})
                         else:
                             current_code = self.generator.generate(

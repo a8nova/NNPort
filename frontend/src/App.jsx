@@ -5,7 +5,7 @@ import DeviceSelector from './components/DeviceSelector'
 
 function App() {
   const [sourceFile, setSourceFile] = useState(null)
-  const [targetType, setTargetType] = useState('DSP')
+  const [targetType, setTargetType] = useState('OpenCL')
   const [deviceConfig, setDeviceConfig] = useState({ 
     connection_type: 'local',
     mock: false, 
@@ -469,7 +469,7 @@ function App() {
               color: activeTab === 'auto' ? 'var(--text-primary)' : 'var(--text-secondary)'
             }}
           >
-            Auto-Port (AI)
+            Auto Port
           </button>
           <button
             onClick={() => { setActiveTab('manual'); setLogs(null); setError(null); }}
@@ -489,33 +489,23 @@ function App() {
         </div>
 
         {activeTab === 'auto' ? (
-          <div className="control-group">
-            <label className="control-label">Source Model (Reference)</label>
-            <input
-              type="file"
-              accept=".py"
-              onChange={(e) => handleUploadGeneric(e.target.files[0], setSourceFile, 'py')}
-            />
-            {sourceFile && <div style={{ marginTop: '0.5rem', fontSize: '0.8rem', color: 'var(--success)' }}>✓ {sourceFile}</div>}
-            {recentFiles.filter(f => f.type === 'py').slice(0, 3).length > 0 && (
-              <div style={{ marginTop: '0.5rem', fontSize: '0.75rem' }}>
-                <div style={{ color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>Recent:</div>
-                {recentFiles.filter(f => f.type === 'py').slice(0, 3).map((f, i) => (
-                  <div 
-                    key={i} 
-                    onClick={() => setSourceFile(f.filename)}
-                    style={{ 
-                      cursor: 'pointer', 
-                      color: sourceFile === f.filename ? 'var(--success)' : 'var(--accent)', 
-                      padding: '0.15rem 0',
-                      textDecoration: sourceFile === f.filename ? 'underline' : 'none'
-                    }}
-                  >
-                    • {f.filename}
-                  </div>
-                ))}
-              </div>
-            )}
+          <div
+            style={{
+              padding: '0.75rem',
+              borderRadius: 'var(--radius)',
+              border: '1px solid var(--border)',
+              background: 'rgba(245, 158, 11, 0.08)',
+              color: 'var(--text-secondary)',
+              marginBottom: '1rem',
+              pointerEvents: 'none',
+            }}
+          >
+            <div style={{ fontWeight: 800, color: '#F59E0B', marginBottom: '0.35rem', letterSpacing: '0.2px' }}>
+              Coming soon
+            </div>
+            <div style={{ fontSize: '0.85rem' }}>
+              Auto Port is disabled in this build.
+            </div>
           </div>
         ) : (
           <>
@@ -825,9 +815,13 @@ function App() {
             value={targetType}
             onChange={(e) => setTargetType(e.target.value)}
           >
-            <option value="DSP">DSP (C6x)</option>
-            <option value="CUDA">NVIDIA CUDA</option>
-            <option value="OpenCL">OpenCL Generic</option>
+            <option value="DSP" disabled style={{ opacity: 0.55 }}>
+              DSP (C6x) (coming soon)
+            </option>
+            <option value="CUDA" disabled style={{ opacity: 0.55 }}>
+              NVIDIA CUDA (coming soon)
+            </option>
+            <option value="OpenCL">OpenCL</option>
           </select>
         </div>
 
@@ -993,11 +987,19 @@ function App() {
 
         {activeTab === 'auto' ? (
           <button
-            onClick={handlePort}
-            disabled={!sourceFile || loading}
-            style={{ width: '100%', padding: '0.75rem', fontSize: '1rem', fontWeight: '600' }}
+            disabled={true}
+            style={{
+              width: '100%',
+              padding: '0.75rem',
+              fontSize: '1rem',
+              fontWeight: '600',
+              opacity: 0.75,
+              cursor: 'not-allowed',
+              color: '#F59E0B',
+            }}
+            title="Coming soon"
           >
-            {loading ? `🔄 Vibing... (0/${maxIterations})` : '🚀 Start Vibe Debugging'}
+            ⏳ Auto Port (coming soon)
           </button>
         ) : (
           <button
