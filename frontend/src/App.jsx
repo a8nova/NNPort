@@ -38,10 +38,11 @@ function App() {
   const [activeTab, setActiveTab] = useState('auto') // 'auto' or 'manual'
   const [manualSourceFile, setManualSourceFile] = useState(null)
   const [manualRefFile, setManualRefFile] = useState(null)
-  const [manualProjectMode, setManualProjectMode] = useState('upload') // 'upload' | 'local'
+  const [manualProjectMode, setManualProjectMode] = useState('local') // 'upload' | 'local'
   const [localProjectPath, setLocalProjectPath] = useState('')
   const [localEntrypoint, setLocalEntrypoint] = useState('')
   const [allowLocalWrite, setAllowLocalWrite] = useState(false)
+  const [confirmWriteOpen, setConfirmWriteOpen] = useState(false)
   const [localPickerOpen, setLocalPickerOpen] = useState(false)
   const [localPickerQuery, setLocalPickerQuery] = useState('')
   const [localPickerLoading, setLocalPickerLoading] = useState(false)
@@ -207,10 +208,10 @@ function App() {
     }
   }
 
-  const handleVerify = async () => {
+  const doVerify = async (allowWriteOverride = null) => {
     if (!manualRefFile) return
     if (manualProjectMode === 'upload' && !manualSourceFile) return
-    if (manualProjectMode === 'local' && (!localProjectPath || !allowLocalWrite)) return
+    if (manualProjectMode === 'local' && (!localProjectPath || !(allowWriteOverride ?? allowLocalWrite))) return
     try {
       setLoading(true)
       setError(null)
@@ -232,7 +233,7 @@ function App() {
               project_path: localProjectPath.trim(),
               entrypoint: localEntrypoint.trim() || null,
               reference_filename: manualRefFile,
-              allow_write: true,
+              allow_write: allowWriteOverride ?? allowLocalWrite,
             }
           : {
               ...payloadCommon,
@@ -309,6 +310,14 @@ function App() {
       setError(err.message)
       setLoading(false)
     }
+  }
+
+  const handleVerify = async () => {
+    if (manualProjectMode === 'local' && localProjectPath.trim() && !allowLocalWrite) {
+      setConfirmWriteOpen(true)
+      return
+    }
+    return doVerify()
   }
 
   const openLocalPicker = async () => {
@@ -536,6 +545,8 @@ function App() {
                   type="button"
                   onClick={() => {
                     setManualProjectMode('local')
+                    // Require explicit confirmation before writing to disk.
+                    setAllowLocalWrite(false)
                     setError(null)
                   }}
                   style={{
@@ -753,6 +764,56 @@ function App() {
                       I understand NNPort will modify files in this folder
                     </span>
                   </label>
+                  {confirmWriteOpen && (
+                    <div
+                      style={{
+                        position: 'fixed',
+                        inset: 0,
+                        background: 'rgba(0,0,0,0.55)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        zIndex: 9999,
+                      }}
+                      onClick={() => setConfirmWriteOpen(false)}
+                    >
+                      <div
+                        style={{
+                          width: 'min(560px, 92vw)',
+                          background: '#101418',
+                          border: '1px solid var(--border)',
+                          borderRadius: 'var(--radius)',
+                          padding: '1rem',
+                          boxShadow: '0 12px 36px rgba(0,0,0,0.6)',
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <div style={{ fontWeight: 800, marginBottom: '0.5rem' }}>Allow NNPort to edit your local project?</div>
+                        <div style={{ fontSize: '0.9rem', color: 'var(--text-secondary)', marginBottom: '0.75rem', whiteSpace: 'pre-wrap' }}>
+                          NNPort will write fixes directly into:
+                          {'\n'}{localProjectPath.trim()}
+                          {'\n\n'}It will also store rollback backups under the project’s NNPort workspace.
+                        </div>
+                        <div style={{ display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' }}>
+                          <button type="button" onClick={() => setConfirmWriteOpen(false)} style={{ padding: '0.5rem 0.75rem' }}>
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setAllowLocalWrite(true)
+                              setConfirmWriteOpen(false)
+                              // Run immediately with explicit allow_write=true
+                              setTimeout(() => doVerify(true), 0)
+                            }}
+                            style={{ padding: '0.5rem 0.75rem', background: 'var(--accent)' }}
+                          >
+                            Allow edits
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
               
@@ -1174,6 +1235,52 @@ function App() {
                           {log.details}
                         </div>
                       )}
+                      {log.changes && ((log.changes.files && log.changes.files.length > 0) || (log.changes.diffs && Object.keys(log.changes.diffs).length > 0)) ? (
+                        (() => {
+                          const changeFiles =
+                            (log.changes.files && log.changes.files.length > 0)
+                              ? log.changes.files
+                              : Object.keys(log.changes.diffs || {});
+                          return (
+                            <details style={{ marginTop: '0.6rem' }}>
+                              <summary style={{ cursor: 'pointer', color: 'var(--accent)', fontSize: '0.85rem' }}>
+                                Changes ({changeFiles.length} file{changeFiles.length === 1 ? '' : 's'})
+                              </summary>
+                              <div style={{ marginTop: '0.5rem' }}>
+                                {changeFiles.map((p) => (
+                                  <div key={p} style={{ marginBottom: '0.75rem' }}>
+                                    <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginBottom: '0.25rem' }}>
+                                      {p}
+                                    </div>
+                                    {log.changes.summaries && log.changes.summaries[p] ? (
+                                      <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '0.4rem' }}>
+                                        {log.changes.summaries[p]}
+                                      </div>
+                                    ) : null}
+                                    {log.changes.diffs && log.changes.diffs[p] ? (
+                                      <pre style={{
+                                        fontSize: '0.75rem',
+                                        backgroundColor: 'rgba(0,0,0,0.35)',
+                                        padding: '0.6rem',
+                                        borderRadius: '4px',
+                                        overflowX: 'auto',
+                                        whiteSpace: 'pre',
+                                        border: '1px solid var(--border)',
+                                      }}>
+                                        {log.changes.diffs[p]}
+                                      </pre>
+                                    ) : (
+                                      <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                                        (diff unavailable)
+                                      </div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            </details>
+                          );
+                        })()
+                      ) : null}
                       {log.source_preview && (
                         <pre style={{
                           fontSize: '0.75rem',

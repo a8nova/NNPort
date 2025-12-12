@@ -31,10 +31,14 @@ env_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), '.env.dev')
 if os.path.exists(env_path) and not os.environ.get("OPENAI_API_KEY") and not os.environ.get("GEMINI_API_KEY"):
     load_dotenv(env_path)
 
+# Hardcoded provider switch.
+# Set to "gemini" or "openai".
+NNPORT_LLM_PROVIDER = "gemini"
+
 class CodeGenerator:
     def __init__(self):
-        # Default to OpenAI as requested
-        self.provider = "openai"
+        # Default provider (hardcoded)
+        self.provider = NNPORT_LLM_PROVIDER
         self.model = None
         self.openai_client = None
         self.openai_legacy = False
@@ -186,7 +190,7 @@ Rules:
 - Ensure the resulting project compiles and runs for the specified target.
 - Do NOT modify or remove any text between lines containing NNPORT_PROTECTED_BEGIN and NNPORT_PROTECTED_END.
 """
-
+        
         # Different prompts for OpenCL vs other targets
         if target == TargetType.OPENCL:
             prompt = f"""
@@ -357,22 +361,33 @@ Return the JSON now.
             response = self.gemini_model.generate_content(p)
             return response.text
 
-        # Try OpenAI
+        # JSON-ops generation
         if output_format == "json_ops":
             last_err: Optional[str] = None
             for attempt in range(max_json_retries):
                 attempt_prompt = prompt if attempt == 0 else f"{prompt}\n\nJSON VALIDATION ERROR:\n{last_err}\n\nReturn corrected JSON only."
-                # Prefer OpenAI, fallback to Gemini
+                # Provider selection (hardcoded). We still allow fallback if the chosen provider isn't configured.
                 raw = None
-                try:
-                    raw = _call_openai(attempt_prompt)
-                except Exception as e:
-                    print(f"OpenAI Error: {e}")
-                if raw is None:
+                if self.provider == "gemini":
                     try:
                         raw = _call_gemini(attempt_prompt)
                     except Exception as e:
                         print(f"Gemini Error: {e}")
+                    if raw is None:
+                        try:
+                            raw = _call_openai(attempt_prompt)
+                        except Exception as e:
+                            print(f"OpenAI Error: {e}")
+                else:
+                    try:
+                        raw = _call_openai(attempt_prompt)
+                    except Exception as e:
+                        print(f"OpenAI Error: {e}")
+                    if raw is None:
+                        try:
+                            raw = _call_gemini(attempt_prompt)
+                        except Exception as e:
+                            print(f"Gemini Error: {e}")
                 if not raw:
                     last_err = "Empty model response."
                     continue
@@ -391,15 +406,26 @@ Return the JSON now.
 
         # Legacy: code blob generation
         code_text = None
-        try:
-            code_text = _call_openai(prompt)
-        except Exception as e:
-            print(f"OpenAI Error: {e}")
-        if not code_text:
+        if self.provider == "gemini":
             try:
                 code_text = _call_gemini(prompt)
             except Exception as e:
                 print(f"Gemini Error: {e}")
+            if not code_text:
+                try:
+                    code_text = _call_openai(prompt)
+                except Exception as e:
+                    print(f"OpenAI Error: {e}")
+        else:
+            try:
+                code_text = _call_openai(prompt)
+            except Exception as e:
+                print(f"OpenAI Error: {e}")
+            if not code_text:
+                try:
+                    code_text = _call_gemini(prompt)
+                except Exception as e:
+                    print(f"Gemini Error: {e}")
 
         if code_text:
             code_text = self._sanitize_code(code_text, target)
@@ -787,7 +813,7 @@ class Compiler:
         compilation_errors = []
         
         extra_include_paths = extra_include_paths or []
-
+        
         # Try custom toolchain if provided
         if toolchain_config and compiler_cmd != "mock":
             # For OpenCL: Ensure we're using a 64-bit ARM compiler (modern GPUs are 64-bit)
@@ -1897,10 +1923,10 @@ class PortingEngine:
             if manifest_dir:
                 project_root = manifest_dir
                 manifest_path = os.path.join(project_root, ".project_manifest.json")
-
+            
                 with open(manifest_path, "r") as f:
                     manifest = json.load(f)
-
+                
                 folder_name = manifest.get("folder_name", "project")
                 upload_root = os.path.dirname(project_root)
 
@@ -1921,7 +1947,7 @@ class PortingEngine:
                                 project_files[rel_inside] = pf.read()
                         except Exception:
                             pass
-
+                
                 project_context = {
                     "folder_name": folder_name,
                     "files": project_files,
@@ -1944,6 +1970,15 @@ class PortingEngine:
                         "source_preview": src_content[:500] + "..." if len(src_content) > 500 else src_content,
                     }
                 )
+                # Treat single-file runs as a minimal project so we can:
+                # - apply JSON ops in-place to the file on disk
+                # - capture and display diffs in the UI
+                try:
+                    project_root = os.path.dirname(manual_source_path)
+                    rel = os.path.basename(manual_source_path)
+                    project_context = {"folder_name": os.path.basename(project_root) or "project", "files": {rel: src_content}, "main_file": rel}
+                except Exception:
+                    pass
         except Exception as e:
             add_log({"stage": "Source Code", "status": "Failed", "details": str(e)})
             return logs
@@ -2064,7 +2099,7 @@ class PortingEngine:
                     add_log({"stage": "Result", "status": "Failed", "details": f"⚠️ STUCK IN LOOP: Same error repeated 3 times.\n\nError: {last_three[0]}\n\nThis is likely a system/infrastructure issue, not a code issue. The AI cannot fix this.\n\nSuggestions:\n1. Check if libOpenCL.so is correct architecture (32-bit vs 64-bit)\n2. Try running locally first (connection_type: local)\n3. Manually verify OpenCL works on device: adb shell 'ls -la /vendor/lib64/libOpenCL.so'\n4. Check SELinux policies"})
                     return logs
             add_log({"stage": f"Iteration {iteration}", "status": "Starting", "details": f"Testing code version {iteration}"})
-
+            
             # Refresh project profile each iteration (files may have changed due to applied ops).
             if project_root and project_context:
                 try:
@@ -2279,7 +2314,7 @@ class PortingEngine:
                             )
                             run_id = f"{job_id or 'manual'}_{iteration}_{uuid.uuid4().hex[:8]}"
                             ws = get_nnport_workspace(project_root, create=True)
-                            apply_ops_in_place(project_root, ops_obj, run_id=run_id, backups_root=ws.backups_root)
+                            res = apply_ops_in_place(project_root, ops_obj, run_id=run_id, backups_root=ws.backups_root)
                             # Reload project context after applying edits
                             try:
                                 refreshed_files = {}
@@ -2294,7 +2329,18 @@ class PortingEngine:
                                 project_context["files"] = refreshed_files
                             except Exception:
                                 pass
-                            add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": f"Applied JSON ops to project (backup: .nnport_backups/{run_id})"})
+                            add_log(
+                                {
+                                    "stage": f"Iteration {iteration}",
+                                    "status": "AI Fix Applied",
+                                    "details": f"Applied JSON ops to project (backup: {res.get('backup_root', run_id)})",
+                                    "changes": {
+                                        "files": res.get("changed_files") or [],
+                                        "diffs": res.get("diffs") or {},
+                                        "summaries": res.get("summaries") or {},
+                                    },
+                                }
+                            )
                         else:
                             current_code = self.generator.generate(
                                 ref_content,
@@ -2305,7 +2351,7 @@ class PortingEngine:
                                 device_config=config,
                                 project_context=project_context,
                             )
-                            add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code version"})
+                        add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code version"})
                         continue
                     except Exception as fix_error:
                         add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Failed", "details": str(fix_error)})
@@ -2370,7 +2416,7 @@ class PortingEngine:
                                     "details": f"⚠️ STUCK IN LOOP: Same error repeated 3 times.\n\nError: {error_signature}\n\nHint: {classified.hint or 'n/a'}",
                                 }
                             )
-                            return logs
+                        return logs
                 
                 # Connection/deployment errors are not fixable by code edits.
                 if "No Android devices connected" in execution_error or "ADB not found" in execution_error or "SSH connection" in execution_error:
@@ -2423,7 +2469,18 @@ class PortingEngine:
                                         raise
                                 else:
                                     raise
-                            add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": f"Applied JSON ops to project (backup: {res.get('backup_root', run_id)})"})
+                            add_log(
+                                {
+                                    "stage": f"Iteration {iteration}",
+                                    "status": "AI Fix Applied",
+                                    "details": f"Applied JSON ops to project (backup: {res.get('backup_root', run_id)})",
+                                    "changes": {
+                                        "files": res.get("changed_files") or [],
+                                        "diffs": res.get("diffs") or {},
+                                        "summaries": res.get("summaries") or {},
+                                    },
+                                }
+                            )
                         else:
                             current_code = self.generator.generate(
                                 ref_content,
@@ -2434,7 +2491,7 @@ class PortingEngine:
                                 device_config=config,
                                 project_context=project_context,
                             )
-                            add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code to fix execution error"})
+                        add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code to fix execution error"})
                         continue
                     except Exception as fix_error:
                         add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Failed", "details": str(fix_error)})
@@ -2471,8 +2528,19 @@ class PortingEngine:
                                 )
                                 run_id = f"{job_id or 'manual'}_shape_{iteration}_{uuid.uuid4().hex[:8]}"
                                 ws = get_nnport_workspace(project_root, create=True)
-                                apply_ops_in_place(project_root, ops_obj, run_id=run_id, backups_root=ws.backups_root)
-                                add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": f"Applied JSON ops to project (backup: .nnport_backups/{run_id})"})
+                                res = apply_ops_in_place(project_root, ops_obj, run_id=run_id, backups_root=ws.backups_root)
+                                add_log(
+                                    {
+                                        "stage": f"Iteration {iteration}",
+                                        "status": "AI Fix Applied",
+                                        "details": f"Applied JSON ops to project (backup: {res.get('backup_root', run_id)})",
+                                        "changes": {
+                                            "files": res.get("changed_files") or [],
+                                            "diffs": res.get("diffs") or {},
+                                        "summaries": res.get("summaries") or {},
+                                        },
+                                    }
+                                )
                             else:
                                 current_code = self.generator.generate(
                                     ref_content,
@@ -2483,9 +2551,9 @@ class PortingEngine:
                                     device_config=config,
                                     project_context=project_context,
                                 )
-                                # Extract preview for logging
-                                code_preview = current_code.get("host_code", "")[:500] if isinstance(current_code, dict) else current_code[:500]
-                                add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code to fix shape", "source_preview": code_preview + "..." if len(code_preview) >= 500 else code_preview})
+                            # Extract preview for logging
+                            code_preview = current_code.get("host_code", "")[:500] if isinstance(current_code, dict) else current_code[:500]
+                            add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated new code to fix shape", "source_preview": code_preview + "..." if len(code_preview) >= 500 else code_preview})
                             continue
                         except Exception as fix_error:
                             add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Failed", "details": str(fix_error)})
@@ -2566,7 +2634,18 @@ class PortingEngine:
                                 project_context["files"] = refreshed_files
                             except Exception:
                                 pass
-                            add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": f"Applied JSON ops to project (backup: .nnport_backups/{run_id})"})
+                            add_log(
+                                {
+                                    "stage": f"Iteration {iteration}",
+                                    "status": "AI Fix Applied",
+                                    "details": f"Applied JSON ops to project (backup: .nnport_backups/{run_id})",
+                                    "changes": {
+                                        "files": res.get("changed_files") or [],
+                                        "diffs": res.get("diffs") or {},
+                                        "summaries": res.get("summaries") or {},
+                                    },
+                                }
+                            )
                         else:
                             current_code = self.generator.generate(
                                 ref_content,
@@ -2577,9 +2656,8 @@ class PortingEngine:
                                 device_config=config,
                                 project_context=project_context,
                             )
-                            # Extract preview for logging
-                            code_preview = current_code.get("host_code", "")[:500] if isinstance(current_code, dict) else current_code[:500]
-                            add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated improved code version", "source_preview": code_preview + "..." if len(code_preview) >= 500 else code_preview})
+                        # In single-file/non-project mode, keep logs concise.
+                        add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Applied", "details": "Generated improved code version"})
                     except Exception as fix_error:
                         add_log({"stage": f"Iteration {iteration}", "status": "AI Fix Failed", "details": str(fix_error)})
             else:

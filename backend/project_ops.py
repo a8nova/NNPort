@@ -10,6 +10,7 @@ import os
 import json
 import shutil
 import time
+import difflib
 from typing import Any, Dict, List, Optional, Set
 
 
@@ -376,7 +377,76 @@ def apply_ops_in_place(
         manifest["created"] = sorted(created)
         with open(os.path.join(backup_root, "manifest.json"), "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
-        return {"backup_root": backup_root, "applied_ops": normalized, "created": sorted(created)}
+
+        # Build lightweight diff previews for UI/logging (best-effort).
+        # We diff against the pre-edit backup stored in backup_root/files/<path> when present.
+        diffs: Dict[str, str] = {}
+        summaries: Dict[str, str] = {}
+        changed_files: List[str] = []
+        for op in normalized:
+            if op["type"] not in ("create", "update"):
+                continue
+            relpath = op["path"]
+            changed_files.append(relpath)
+            before_path = os.path.join(backup_root, "files", relpath)
+            try:
+                before_text = read_file_text(before_path) if os.path.exists(before_path) else ""
+            except Exception:
+                before_text = ""
+            after_text = op.get("content") or ""
+            try:
+                before_lines = before_text.splitlines()
+                after_lines = after_text.splitlines()
+                ud = difflib.unified_diff(
+                    before_lines,
+                    after_lines,
+                    fromfile=f"a/{relpath}",
+                    tofile=f"b/{relpath}",
+                    lineterm="",
+                    n=3,
+                )
+                diff_text = "\n".join(list(ud))
+                if diff_text:
+                    # Cap diff size to keep websocket payloads sane.
+                    diff_lines = diff_text.splitlines()
+                    if len(diff_lines) > 200:
+                        diff_text = "\n".join(diff_lines[:200]) + "\n... (diff truncated) ..."
+                    diffs[relpath] = diff_text
+                    # Basic human-ish summary: show first removed line vs first added line.
+                    try:
+                        removed = None
+                        added = None
+                        for ln in diff_lines:
+                            if ln.startswith("---") or ln.startswith("+++") or ln.startswith("@@"):
+                                continue
+                            if removed is None and ln.startswith("-"):
+                                removed = ln[1:].strip()
+                                continue
+                            if added is None and ln.startswith("+"):
+                                added = ln[1:].strip()
+                                continue
+                            if removed is not None and added is not None:
+                                break
+                        if removed and added and removed != added:
+                            summaries[relpath] = f"Changed `{removed}` → `{added}`"
+                        elif added and not removed:
+                            summaries[relpath] = f"Added `{added}`"
+                        elif removed and not added:
+                            summaries[relpath] = f"Removed `{removed}`"
+                    except Exception:
+                        pass
+            except Exception:
+                # non-fatal
+                pass
+
+        return {
+            "backup_root": backup_root,
+            "applied_ops": normalized,
+            "created": sorted(created),
+            "changed_files": changed_files,
+            "diffs": diffs,
+            "summaries": summaries,
+        }
 
     except Exception:
         # Best-effort rollback
